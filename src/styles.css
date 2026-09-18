@@ -131,6 +131,40 @@ body {
   );
 }
 
+/* Sits top-right, clear of the wordmark and the persona cards. Only rendered
+   while the intro is still muted — once sound is earned it never returns. */
+.intro__unmute {
+  position: absolute;
+  top: calc(env(safe-area-inset-top) + 20px);
+  right: calc(env(safe-area-inset-right) + 20px);
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border-radius: 999px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--ink);
+  cursor: pointer;
+  animation: introUnmuteIn 460ms cubic-bezier(0.32, 0.72, 0, 1) 700ms both;
+  transition: transform 180ms cubic-bezier(0.32, 0.72, 0, 1), opacity 180ms linear;
+}
+
+.intro__unmute:hover { transform: scale(1.03); }
+.intro__unmute:active { transform: scale(0.98); }
+
+@keyframes introUnmuteIn {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .intro__unmute { animation: none; transition: none; }
+}
+
 .intro__content {
   position: absolute;
   inset: 0;
