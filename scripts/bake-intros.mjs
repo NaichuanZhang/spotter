@@ -100,10 +100,22 @@ const REF_IMAGES = {
  * *calm*, which reads as flat for a workout coach no matter how the prompt is
  * written. Voice selection is half the energy problem; the prompt is the other half.
  */
+/**
+ * MUST MATCH src/coach/personas.ts. The intro clip and the live coaching voice are
+ * the same character, so a mismatch means the user hears one voice introduce a coach
+ * and a different voice coach them — a character break in the first ten seconds.
+ *
+ * These are the SHIPPED picks (measured, not the docs' adjectives):
+ *   mean      jake     — deepest measured F0 (122 Hz), drill-instructor timbre
+ *   nice      eleanor  — loudest AND fastest preset, despite docs saying "calm"
+ *   sarcastic oliver   — quietest preset ON PURPOSE: deadpan raises speed, not volume
+ * The earlier chloe/marcus values here were the plan's FALLBACK picks, never its
+ * ship picks, and they disagreed with personas.ts.
+ */
 const VOICES = {
   mean: 'jake',
-  nice: 'chloe',
-  sarcastic: 'marcus',
+  nice: 'eleanor',
+  sarcastic: 'oliver',
 }
 
 const VOICE_FALLBACK = 'jake'
