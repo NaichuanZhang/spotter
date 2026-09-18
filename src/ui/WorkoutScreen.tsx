@@ -64,7 +64,19 @@ interface WorkoutScreenProps {
   readonly clip: ReferenceClipSpec | null
   readonly onDismissClip: () => void
   readonly getLandmarks: LandmarkSource
-  readonly onVideoReady: (video: HTMLVideoElement) => void
+  /**
+   * Hand the element to the pose engine. Returns true when the engine has CLAIMED
+   * it — meaning the engine owns the camera from here and this component must not
+   * touch srcObject again.
+   *
+   * The return value has to be synchronous. The engine claims the element before
+   * it awaits getUserMedia, so `element.srcObject` stays null for as long as the
+   * permission prompt is on screen. The fallback below used to test srcObject,
+   * which meant a slow "Allow" click opened a SECOND camera stream and the two
+   * assignments aborted each other's play() — the AbortError this comment exists
+   * to prevent coming back.
+   */
+  readonly onVideoReady: (video: HTMLVideoElement) => boolean
 }
 
 export default function WorkoutScreen({
@@ -107,17 +119,21 @@ export default function WorkoutScreen({
     const element = videoRef.current
     if (!element) return undefined
     element.muted = true
-    onVideoReady(element)
+    const claimed = onVideoReady(element)
 
     let cancelled = false
-    const timer = window.setTimeout(() => {
-      if (cancelled || element.srcObject) return
-      takeOverCamera(element)
-    }, CAMERA.FALLBACK_DELAY_MS)
+    // Only ever arm the fallback when NOTHING claimed the element. Racing the
+    // engine on a timer opens a second getUserMedia and both plays abort.
+    const timer = claimed
+      ? null
+      : window.setTimeout(() => {
+          if (cancelled || element.srcObject) return
+          takeOverCamera(element)
+        }, CAMERA.FALLBACK_DELAY_MS)
 
     return () => {
       cancelled = true
-      window.clearTimeout(timer)
+      if (timer !== null) window.clearTimeout(timer)
       const owned = ownedStreamRef.current
       if (owned) {
         stopStream(owned)
@@ -128,7 +144,11 @@ export default function WorkoutScreen({
 
   return (
     <main className="workout">
-      <video ref={videoRef} className="workout__video" autoPlay muted playsInline />
+      {/* NO autoPlay: assigning srcObject would make the browser start its own
+          load, which interrupts the explicit play() the pose engine awaits and
+          throws AbortError. play() is called deliberately by whoever owns the
+          stream. muted + playsInline stay — iOS Safari needs both. */}
+      <video ref={videoRef} className="workout__video" muted playsInline />
       <SkeletonOverlay videoRef={videoRef} getLandmarks={getLandmarks} faultActive={latched !== null} />
       <div className="workout__tint" aria-hidden="true" />
       <div className="workout__rim" aria-hidden="true" />

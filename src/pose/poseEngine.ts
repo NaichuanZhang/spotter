@@ -164,6 +164,16 @@ async function openCamera(video: HTMLVideoElement): Promise<MediaStream> {
   video.playsInline = true
   video.muted = true
   await video.play().catch((cause: unknown) => {
+    // An AbortError means a NEW load request superseded this play() — the browser
+    // autoplaying, or another owner reassigning srcObject. It is only fatal if the
+    // element actually ended up not playing; when frames are flowing the rejected
+    // promise is noise and tearing the stream down here would kill a working
+    // camera. Checked via readyState rather than `paused`, because `paused` is
+    // already false while a play() is still pending.
+    const aborted = cause instanceof DOMException && cause.name === 'AbortError'
+    const flowing = video.readyState >= 2 /* HAVE_CURRENT_DATA */ && !video.ended
+    if (aborted && flowing) return
+
     stream.getTracks().forEach((t) => t.stop())
     throw new PoseEngineError('camera_failed', 'The video element refused to play.', { cause })
   })

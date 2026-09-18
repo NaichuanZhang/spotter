@@ -259,9 +259,15 @@ export default function App() {
     openSession()
   }, [openSession])
 
+  /**
+   * Returns true when the pose engine has CLAIMED the element and owns the camera.
+   * The claim is synchronous — it lands before start() awaits getUserMedia — so
+   * WorkoutScreen can suppress its fallback instead of racing the permission
+   * prompt and opening a second stream.
+   */
   const handleVideoReady = useCallback(
-    (video: HTMLVideoElement) => {
-      if (engineRef.current) return
+    (video: HTMLVideoElement): boolean => {
+      if (engineRef.current) return true
       try {
         const options = {
           video,
@@ -275,9 +281,11 @@ export default function App() {
           console.error('[spotter] pose engine failed to start:', error)
           setFatal(describe(error))
         })
+        return true
       } catch (error) {
         console.error('[spotter] pose engine could not be created:', error)
         setFatal(describe(error))
+        return false
       }
     },
     [handleEvent],
