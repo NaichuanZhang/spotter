@@ -30,6 +30,11 @@
  * `analyze` is a pure file->file step, so post-processing can be re-run and
  * re-tuned without touching the browser again.
  *
+ * This file owns I/O, the server and the CLI. The measurement itself lives in three
+ * pure sibling modules: `landmark-geometry.mjs` (angles, gates, smoothing),
+ * `landmark-reps.mjs` (segmentation, hysteresis) and `landmark-analysis.mjs`
+ * (exemplar, normalisation, serialisation).
+ *
  * ---------------------------------------------------------------------------
  * OUTPUT SCHEMA — public/clips/landmarks.json  (schemaVersion 1)
  * ---------------------------------------------------------------------------
@@ -44,44 +49,77 @@
  *   source:        { basename, durationSec, width, height, fps, frameStep,
  *                    requestedFrames }
  *   extraction:    { model, wasmBase, delegate, runningMode, library,
- *                    detectedFrames, usableFrames, rejectedFrames,
- *                    elapsedMs, userAgent }
+ *                    detectedFrames, usableFrames, rejectedFrames, rejections,
+ *                    framesEmitted, bodyLineMeasurableFrames, elapsedMs, userAgent }
  *   tunables:      { ... }                   // the thresholds actually used,
  *                                            // mirrored from src/pose/*.ts
+ *   gate:          { coreJoints, bodyLineJoints, visibilityThreshold, relaxation }
+ *   repDetection:  { appThresholds: { downEnterDeg, upEnterDeg, repsScored, note },
+ *                    used:          { downEnterDeg, upEnterDeg, minAmplitudeDeg,
+ *                                     minRepFrames, repsScored,
+ *                                     cyclesRejectedByGuards, note } }
+ *                                            // TWO counts on purpose: what the live
+ *                                            // app's thresholds would have scored,
+ *                                            // and what `reps` below came from.
  *   landmarkNames: string[33]                // BlazePose index -> name
  *   frames: [{                               // ONLY usable frames, time-ordered
- *     i, t, tMs,                             // i = source frame index, t = seconds
+ *     i, t,                                  // i = source frame index, t = seconds
  *     side: 'left'|'right',                  // limb chain the angles were measured on
- *     angles: { elbow, bodyLine, hipDeviation, neck|null, flare|null },   // raw
- *     smoothed: { elbow, bodyLine, hipDeviation },                        // median-5
- *     lm: [[x, y, z, visibility] x 33]       // compact; index = BlazePose index
+ *     bodyLineMeasurable: boolean,           // false = the ankle was not in frame
+ *     weak: string[],                        // joints under the visibility gate:
+ *                                            // MODEL EXTRAPOLATION, not observation
+ *     angles: { elbow, bodyLine|null, hipDeviation|null, neck|null, flare|null },
+ *     smoothed: { elbow, bodyLine|null, hipDeviation|null },              // median-5
+ *     lm: [[x, y, visibility] x 33]          // compact; index = BlazePose index.
+ *                                            // z is dropped on purpose (see below).
  *   }]
- *   segments: [{ index, startFrame, endFrame, frameCount, startT, endT }]
- *                                            // contiguous runs of usable frames.
- *                                            // The rep machine RESETS between
- *                                            // segments so a talking-head gap can
- *                                            // never bridge two halves of a rep.
+ *   segments: [{ index, startFrame, endFrame, frameCount, startT, endT,
+ *                bodyLineMeasurableFrames,
+ *                startedBy: 'start'|'gap'|'cut' }]
+ *                                            // runs of CONTINUOUS MOTION. 'gap' = the
+ *                                            // detector lost the pose; 'cut' = the
+ *                                            // torso teleported, i.e. another shot.
+ *                                            // The rep machine RESETS between them, so
+ *                                            // a cutaway can neither bridge two halves
+ *                                            // of a rep nor lend one shot's lockout
+ *                                            // angle to a rep performed in another.
  *   reps: [{ index, segment, startFrame, bottomFrame, endFrame,
- *            startT, bottomT, endT,
- *            minElbowAngle, maxElbowAngle, depthPct, hipDeviationDeg,
- *            worstSag, worstPike, descentMs, ascentMs, frameCount,
- *            partial, clean }]               // same fields the app's RepMetrics has
+ *            startT, bottomT, endT, frameCount,
+ *            minElbowAngle, maxElbowAngle, amplitudeDeg, depthPct,
+ *            descentMs, ascentMs,
+ *            bodyLineMeasurable, hipFrames,
+ *            hipDeviationDeg|null, worstSag|null, worstPike|null,
+ *            partial, meetsAppLockout, clean|null }]
+ *                                            // hip fields and `clean` are NULL when
+ *                                            // no frame of the rep had a measurable
+ *                                            // body line. Null means "not seen", not
+ *                                            // "fine" and not "bad".
  *   good_rep: null | {                       // THE exemplar: deepest + straightest
- *     repIndex, score, frameCount, durationMs, stats: <the rep above>,
- *     normalisation: { anchorX, anchorY, scale, flippedX, description },
- *     frames: [{ phase, tMs, i,
- *                angles: { elbow, bodyLine, hipDeviation, neck|null, flare|null },
+ *     repIndex, score, compromises: string[],// compromises = what had to be relaxed
+ *     frameCount, durationMs,
+ *     trim: { cycleFrames, leading, trailing, maxCoreJointJump, limit, note },
+ *                                            // end frames DROPPED as detector glitches
+ *     stats: <the rep above>,                // measured over the UNTRIMMED cycle
+ *     normalisation: { anchorX, anchorY, scale, flippedX, scaleBasis, anchorBasis,
+ *                      measuredSide, description },
+ *     frames: [{ phase, tMs, i, weak,
+ *                angles: { elbow, bodyLine|null, hipDeviation|null, neck|null, flare|null },
  *                lm: [[x, y, visibility] x 33] }]   // NORMALISED, see below
  *   }
  * }
  *
+ * `z` is dropped from every landmark: it is hip-relative, an order of magnitude
+ * noisier than x/y, useless for a horizontal body, and unread by the app.
+ *
  * good_rep normalisation (one similarity transform for the whole rep, never
  * per-frame — a per-frame fit would cancel the very motion we are capturing):
- *   - translate so the rep-median ground contact (wrist/ankle midpoint) is (0,0)
- *   - scale so the rep-median shoulder->ankle distance is 1
+ *   - translate so the rep-median ground contact is (0,0)
+ *   - scale so the rep-median `scaleBasis` body length is 1
  *   - mirror x when needed so the head always points -x (feet at +x)
  *   - y still grows DOWNWARD, so sag is still +y. Do not "fix" this.
- * A renderer maps that to pixels with: px = cx + x*S, py = cy + y*S.
+ * A renderer maps that to pixels with: px = cx + x*S, py = cy + y*S. Read
+ * `scaleBasis`: 1.0 unit is shoulder->ankle when the feet were in frame and
+ * shoulder->hip when they were not, which is a factor of ~2 difference.
  *
  * HONESTY RULE: frames with no pose, or with a pushup-relevant joint below the
  * app's own visibility gate, are DROPPED — never interpolated, never zero-filled.
@@ -96,7 +134,8 @@ import { createServer } from 'node:http'
 import { dirname, extname, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { analyseExtraction, LANDMARK_NAMES } from './landmark-analysis.mjs'
+import { analyseExtraction } from './landmark-analysis.mjs'
+import { LANDMARK_NAMES } from './landmark-geometry.mjs'
 
 // ---------------------------------------------------------------- tunables
 
@@ -178,10 +217,24 @@ const EXTRACTION = {
    * a new segment instead of welding two unrelated halves into a phantom rep.
    */
   maxFrameGap: 6,
+  /**
+   * Head+torso movement between consecutive frames, in torso lengths, above which the
+   * editor cut to another shot rather than the body having moved.
+   *
+   * MEASURED on this source: honest frame-to-frame torso movement has a median of
+   * 0.023 and a 99th percentile of 0.34; the six real cuts land between 1.0 and 2.5.
+   * 0.5 sits in the empty gap between those two populations. It matters because the
+   * elbow angle "at the top of the rep" is otherwise inherited across a cut — which
+   * reports a lockout the demonstrator never performed.
+   */
+  cutJumpBodyLengths: 0.5,
   /** A run shorter than this cannot contain a rep and is not worth reporting. */
   minSegmentFrames: 8,
-  /** Rounding for the committed JSON. Enough precision to draw from; not 17 digits. */
-  decimals: { xy: 5, z: 4, visibility: 3, angle: 2, time: 4 },
+  /**
+   * Rounding for the committed JSON. Enough precision to draw from; not 17 digits.
+   * There is no `z`: it is dropped entirely, not rounded.
+   */
+  decimals: { xy: 5, visibility: 3, angle: 2, time: 4 },
 }
 
 // ---------------------------------------------------------------- helpers
@@ -497,15 +550,25 @@ function round(value, decimals) {
   return Math.round(value * factor) / factor
 }
 
-function formatRepLine(rep) {
-  const flags = [rep.partial ? 'PARTIAL' : 'full', rep.clean ? 'clean' : 'not-clean'].join('/')
+function formatHip(rep) {
+  if (!rep.bodyLineMeasurable || rep.hipDeviationDeg === null) return 'hip n/a (ankle off-frame)'
   const bend = rep.hipDeviationDeg >= 0 ? 'sag' : 'pike'
+  const sign = rep.hipDeviationDeg >= 0 ? '+' : ''
+  return `hip ${sign}${rep.hipDeviationDeg.toFixed(1)}deg ${bend} (${rep.hipFrames} frames)`
+}
+
+function formatRepLine(rep) {
+  const clean = rep.clean === null ? 'clean?' : rep.clean ? 'clean' : 'not-clean'
+  const flags = [
+    rep.partial ? 'PARTIAL' : 'full-depth',
+    clean,
+    rep.meetsAppLockout ? 'app-lockout-ok' : 'NO-LOCKOUT',
+  ].join('/')
   return (
     `  rep ${String(rep.index).padStart(2)}  frames ${rep.startFrame}-${rep.endFrame}` +
     ` (${rep.frameCount})  t ${rep.startT.toFixed(2)}-${rep.endT.toFixed(2)}s` +
     `  elbow ${rep.minElbowAngle.toFixed(1)}->${rep.maxElbowAngle.toFixed(1)}deg` +
-    `  depth ${rep.depthPct.toFixed(0)}%` +
-    `  hip ${rep.hipDeviationDeg >= 0 ? '+' : ''}${rep.hipDeviationDeg.toFixed(1)}deg (${bend})` +
+    `  depth ${rep.depthPct.toFixed(0)}%  ${formatHip(rep)}` +
     `  ${rep.descentMs}ms down / ${rep.ascentMs}ms up  ${flags}`
   )
 }
@@ -548,25 +611,43 @@ async function analyze() {
   log(`wrote ${PATHS.output} (${((bytes ?? 0) / 1e6).toFixed(2)} MB)`)
   log('')
   log('EXTRACTION')
-  log(`  detected frames : ${result.extraction.detectedFrames} / ${result.source.requestedFrames} requested`)
-  log(`  usable frames   : ${result.extraction.usableFrames} (dropped ${result.extraction.rejectedFrames}: no pose or a core joint under the visibility gate)`)
-  log(`  usable segments : ${result.segments.length}`)
-  for (const segment of result.segments) {
-    log(`    segment ${segment.index}: frames ${segment.startFrame}-${segment.endFrame} (${segment.frameCount}), t ${segment.startT.toFixed(2)}-${segment.endT.toFixed(2)}s`)
+  log(`  detected frames   : ${result.extraction.detectedFrames} / ${result.source.requestedFrames} requested (${result.extraction.delegate} delegate, ${result.extraction.elapsedMs}ms)`)
+  log(`  usable frames     : ${result.extraction.usableFrames} (dropped ${result.extraction.rejectedFrames})`)
+  for (const [reason, count] of Object.entries(result.extraction.rejections)) {
+    log(`      ${reason}: ${count}`)
   }
+  log(`  frames emitted    : ${result.extraction.framesEmitted} (usable frames inside a kept segment)`)
+  log(`  body line usable  : ${result.extraction.bodyLineMeasurableFrames} frames had an ankle above the ${tunables.visibility.joint} visibility gate`)
+  log(`  usable segments   : ${result.segments.length}`)
+  for (const segment of result.segments) {
+    log(`      segment ${segment.index} (after ${segment.startedBy}): frames ${segment.startFrame}-${segment.endFrame} (${segment.frameCount}), t ${segment.startT.toFixed(2)}-${segment.endT.toFixed(2)}s, body-line frames ${segment.bodyLineMeasurableFrames}`)
+  }
+  log('')
+  log('REP DETECTION')
+  const app = result.repDetection.appThresholds
+  const used = result.repDetection.used
+  log(`  app thresholds (${app.downEnterDeg}/${app.upEnterDeg}deg) would have scored: ${app.repsScored}`)
+  log(`  used  thresholds (${used.downEnterDeg}/${used.upEnterDeg}deg, min ${used.minAmplitudeDeg}deg swing, min ${used.minRepFrames} frames) scored: ${used.repsScored}` +
+    `  (${used.cyclesRejectedByGuards} cycles rejected by the guards)`)
   log('')
   log(`REPS FOUND: ${result.reps.length}`)
   for (const rep of result.reps) log(formatRepLine(rep))
   if (result.reps.length === 0) {
-    log('  none. The hysteresis gate (elbow below ' +
-      `${tunables.rep.downEnterDeg}deg then back above ${tunables.rep.upEnterDeg}deg) never completed.`)
+    log('  none. The hysteresis gate never completed a down-and-up cycle. ' +
+      'No landmarks were invented to manufacture one.')
   }
   log('')
   if (result.good_rep) {
-    const stats = result.good_rep.stats
-    log(`GOOD REP EXEMPLAR: rep ${stats.index} — ${result.good_rep.frameCount} frames, ` +
-      `${result.good_rep.durationMs}ms, depth ${stats.depthPct.toFixed(0)}%, ` +
-      `min elbow ${stats.minElbowAngle.toFixed(1)}deg, hip ${stats.hipDeviationDeg >= 0 ? '+' : ''}${stats.hipDeviationDeg.toFixed(1)}deg`)
+    const good = result.good_rep
+    const stats = good.stats
+    log(`GOOD REP EXEMPLAR: rep ${stats.index} — ${good.frameCount} frames, ${good.durationMs}ms, ` +
+      `depth ${stats.depthPct.toFixed(0)}%, elbow ${stats.minElbowAngle.toFixed(1)}->${stats.maxElbowAngle.toFixed(1)}deg, ` +
+      `${formatHip(stats)}, score ${good.score}`)
+    log(`  normalisation: origin ${good.normalisation.anchorBasis}, 1.0 unit = ${good.normalisation.scaleBasis}` +
+      ` (${good.normalisation.scale}), flippedX ${good.normalisation.flippedX}, side ${good.normalisation.measuredSide}`)
+    log(`  glitch trim  : ${good.trim.leading} leading + ${good.trim.trailing} trailing of ${good.trim.cycleFrames} cycle frames dropped` +
+      ` (limit ${good.trim.limit} body-lengths/frame, worst kept jump ${good.trim.maxCoreJointJump})`)
+    log(`  compromises  : ${good.compromises.length === 0 ? 'none' : good.compromises.join(', ')}`)
   } else {
     log('GOOD REP EXEMPLAR: none — no rep cleared the exemplar requirements. ' +
       'Nothing was invented to fill the gap.')

@@ -24,7 +24,65 @@ export const HIGGS = {
   pcmRate: 24000,
   subprotocol: 'realtime',
   secretPrefix: 'bai-client-secret.',
-  temperature: 0.8,
+  /**
+   * 0.3, NOT 0.8. This is a measurement precondition, not a taste setting: every
+   * acoustic number this file and personas.ts are tuned to was taken at 0.3. At
+   * 0.8 the model overruns the 14-word cap (13-21 words observed) and at 1.2 one
+   * of three free generations degenerated into mixed Cyrillic/CJK gibberish.
+   * temperature is NOT a delivery lever — on pinned text 0.2 vs 1.2 sat entirely
+   * inside the spread. All it changes is word choice and length, and length is
+   * exactly what invalidates the orthography result.
+   */
+  temperature: 0.3,
+  /**
+   * audio.output.speed hard range. Outside it the server accepts and echoes the
+   * value, then never emits an audio delta and the session wedges with no error
+   * and no close (confirmed at 0.1 / 0.2 / 0 / -1 / 5 / 6 / 8 / 100; one wait ran
+   * 260s). Clamp BEFORE sending; there is nothing to validate after.
+   */
+  speedMin: 0.25,
+  speedMax: 4.0,
+  /**
+   * Demo ceiling. speed is a naive resample, so pitch rises 1:1: F0 measured
+   * 146 -> 185 -> 222 -> 296 Hz at speed 1.0 -> 1.25 -> 1.5 -> 2.0. Above ~1.25
+   * it is audibly a sped-up tape rather than an urgent coach.
+   */
+  speedSafeMax: 1.25,
+  speedDefault: 1.0,
+  /**
+   * audio.output.temperature. UNDOCUMENTED, and the value that WOULD be sent if
+   * `useOutputTemperature` were true. 0 does deliver what it promised — 8 of 9 runs
+   * byte-identical, where at the server default the SAME text swung RMS 0.065-0.121
+   * (1.9x) run to run. It is off anyway; see below.
+   */
+  outputTemperature: 0,
+  /**
+   * OFF, and this is a regression that was measured on the shipped payload, not a
+   * taste call. `audio.output.temperature: 0` is greedy decoding, and greedy
+   * decoding degenerates: across 18 live turns (3 personas x 6 varied [EVENT]
+   * lines) 5 replies ran away, 28%, one per persona minimum —
+   *   sarcastic/oliver 3/6: 72.6s, 141.9s and 71.7s of PCM for a ~2s line, i.e.
+   *     speech, then ~68s of digital silence, then a short tail
+   *   mean/jake 1/6 (73.8s) and nice/eleanor 1/6 (77.2s, and that one was 75.7s
+   *     SPEECH-ACTIVE at RMS 0.286 — a loud 75-second babble, not silence)
+   * With this field omitted the same 18 turns produced 0 runaways and turns also
+   * came back inside the word cap (nice 11-14 words vs 14-23 at 0), so the field
+   * was inflating length as well: audio and text share one decode.
+   * A 75-second utterance is a demo-ender: audioOut's maxQueuedSec drops every
+   * chunk past 20s, so the line loses its tail and the UI reads "speaking" for 20s.
+   * Repeatability is not worth a 28% chance of that. Annotated `boolean` so the
+   * guarded branch does not narrow to dead code.
+   */
+  useOutputTemperature: false as boolean,
+  /**
+   * `speed` and `audio.output.temperature` are UNDOCUMENTED. They work today and
+   * are silently ignored by design elsewhere in this API, but an undocumented
+   * field can be withdrawn and start answering 400. Flip this to false and the
+   * session payload goes back to exactly what shipped before — one-character fix
+   * on stage. `speed` survived the runaway probe cleanly (oliver at 1.15 with no
+   * output temperature: 6/6 normal), so it is the half of the pair worth keeping.
+   */
+  useUndocumentedAudioParams: true,
   /** Give up if session.created never lands. */
   connectTimeoutMs: 12_000,
   /** Bound on the dedupe set so a long session cannot leak. */
@@ -89,6 +147,8 @@ export interface SessionSetup {
   instructions: string
   voice: string
   temperature?: number
+  /** Per-persona pace. Clamped by clampSpeed; omit for HIGGS.speedDefault. */
+  speed?: number
 }
 
 export interface HiggsCallbacks {
@@ -117,6 +177,12 @@ export interface HiggsConnection {
   sendToolOutput: (callId: string, result: unknown) => void
   /** Persona hot-swap: re-sends the full session object with new instructions/voice. */
   updateSession: (setup: SessionSetup) => void
+  /**
+   * Pace for the NEXT response. MUST be sent before conversation.item.create —
+   * a patch never applies retroactively to a response already in flight, and
+   * response-scoped overrides are silently dropped (byte-identical output).
+   */
+  setSpeed: (speed: number) => void
   /** True between response.created and response.done. */
   isResponding: () => boolean
   isOpen: () => boolean
@@ -177,8 +243,21 @@ function readTokenValue(body: unknown): string | null {
 // ------------------------------------------------------------------- session.update
 
 /**
- * The full session object. Always sent whole — partial-merge semantics are not
- * documented, and a persona swap that half-applies is worse than one extra frame.
+ * Guards the one value that can wedge a session beyond recovery. Out-of-range
+ * `speed` passes server validation and echoes back in session.updated, then no
+ * audio delta ever arrives — no error, no close, nothing to retry on. So the only
+ * place this can be caught is before the frame leaves.
+ */
+export function clampSpeed(speed: number | undefined): number {
+  if (typeof speed !== 'number' || !Number.isFinite(speed)) return HIGGS.speedDefault
+  return Math.min(Math.max(speed, HIGGS.speedMin), HIGGS.speedSafeMax)
+}
+
+/**
+ * The full session object. A persona swap changes `voice`, so this still sends the
+ * whole thing. Partial merge IS now verified (deep merge, five consecutive patches,
+ * including an empty `{}` — voice, audio.output.temperature and instructions all
+ * survived omission), but the partial path is buildSpeedPatch, not this one.
  */
 export function buildSessionPayload(setup: SessionSetup): Record<string, unknown> {
   return {
@@ -195,6 +274,7 @@ export function buildSessionPayload(setup: SessionSetup): Record<string, unknown
         output: {
           format: { type: 'audio/pcm', rate: HIGGS.pcmRate },
           voice: setup.voice,
+          ...audioOutputTuning(setup.speed),
         },
       },
       tools: TOOL_DEFS,
@@ -202,6 +282,38 @@ export function buildSessionPayload(setup: SessionSetup): Record<string, unknown
       temperature: setup.temperature ?? HIGGS.temperature,
     },
   }
+}
+
+/**
+ * The undocumented output fields, behind the kill switch. `temperature` is omitted
+ * entirely rather than sent as the server default, because the default value is not
+ * documented either — the only safe way to ask for it is to say nothing.
+ */
+function audioOutputTuning(speed: number | undefined): Record<string, number> {
+  if (!HIGGS.useUndocumentedAudioParams) return {}
+  const tuning: Record<string, number> = { speed: clampSpeed(speed) }
+  if (HIGGS.useOutputTemperature) tuning.temperature = HIGGS.outputTemperature
+  return tuning
+}
+
+/**
+ * Speed-only patch — the per-utterance pace lever. Partial merge is verified: this
+ * frame changes the pace and leaves voice, instructions and audio.output.temperature
+ * untouched, and the server echoes the new speed back in session.updated.
+ *
+ * READ THIS BEFORE PUTTING IT IN A HOT PATH. Omitting `voice` does NOT skip the
+ * server's voices lookup. Measured over two runs of 20 consecutive speed-only
+ * patches in one live session — 12 acks / 8 errors at a 300 ms gap, 19 acks / 1
+ * error at 2500 ms — every failure read "Could not validate voice 'jake': voices
+ * API returned HTTP 429" for a frame that carries no voice at all. The session
+ * survives (the rejected patch is a no-op), but the caller gets a CoachError per
+ * failure. session.ts ships this disabled behind PER_EVENT_PACE_ENABLED.
+ *
+ * `format` is not required in a partial patch (verified); if a patch ever fails
+ * for some other reason, add it back first.
+ */
+export function buildSpeedPatch(speed: number): Record<string, unknown> {
+  return { type: 'session.update', session: { audio: { output: { speed: clampSpeed(speed) } } } }
 }
 
 // ------------------------------------------------------------------------ connect
@@ -317,6 +429,7 @@ function createState(ws: WebSocket, cb: HiggsCallbacks): SocketState {
         send({ type: 'response.create' })
       },
       updateSession: (setup) => send(buildSessionPayload(setup)),
+      setSpeed: (speed) => send(buildSpeedPatch(speed)),
       isResponding: () => responding,
       isOpen: () => ws.readyState === WebSocket.OPEN,
       close: () => {

@@ -60,6 +60,8 @@ const TUNING = {
    * boundary between frame i and frame i+1.
    */
   frameSamplePhase: 0.5,
+  /** Upper bound on the post-seek wait before the frame is blitted. See `settleFrame`. */
+  frameSettleMs: 40,
   /** Progress lines are cheap but not free; log every N frames. */
   logEveryFrames: 60,
   /** Retry an upload once — a transient POST failure would throw away minutes of work. */
@@ -150,17 +152,34 @@ function waitForEvent(target, event, timeoutMs, label) {
 }
 
 /**
- * Wait until the frame at the current position is actually PRESENTED. 'seeked' fires
- * when the seek completed, which in practice precedes the new frame being available
- * to the compositor; detecting on the previous frame would shift every measurement by
- * one frame. requestVideoFrameCallback is the exact signal; two rAFs is the fallback.
+ * Give the decoder a moment after 'seeked' before reading pixels.
+ *
+ * MUST BE BOUNDED. requestVideoFrameCallback is the exact "this frame is now
+ * presented" signal, but it only fires when a frame reaches the compositor — and a
+ * PAUSED video in a headless browser may never present one, in which case awaiting it
+ * alone hangs forever on frame 0 with no error and no timeout. (Observed, not
+ * hypothetical.) So it races a short sleep: whichever comes first, we then blit.
  */
-function waitForPresentedFrame() {
+function settleFrame() {
   if (typeof video.requestVideoFrameCallback === 'function') {
-    return new Promise((done) => video.requestVideoFrameCallback(() => done()))
+    return Promise.race([
+      new Promise((done) => video.requestVideoFrameCallback(() => done())),
+      sleep(TUNING.frameSettleMs),
+    ])
   }
-  return new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(() => done())))
+  return sleep(TUNING.frameSettleMs)
 }
+
+/**
+ * Detection reads from a canvas, not from the <video> directly.
+ *
+ * Handing MediaPipe the paused video element makes the sampled frame depend on the
+ * compositor, which is exactly the thing that is unreliable here. A `drawImage` after
+ * 'seeked' is synchronous and gives the detector the same pixels every run — and the
+ * same pixels the app's camera path would have given it, just sourced from a file.
+ */
+const canvas = document.createElement('canvas')
+const canvasCtx = canvas.getContext('2d', { alpha: false })
 
 async function loadVideo(url) {
   video.src = url
@@ -170,6 +189,9 @@ async function loadVideo(url) {
   if (!(video.videoWidth > 0) || !(video.videoHeight > 0)) {
     throw new Error('video reported 0x0 — the browser decoded no video stream (codec unsupported?)')
   }
+  if (!canvasCtx) throw new Error('no 2d canvas context — cannot sample frames')
+  canvas.width = video.videoWidth
+  canvas.height = video.videoHeight
   log(`video ready: ${video.videoWidth}x${video.videoHeight}, duration ${video.duration.toFixed(3)}s`)
 }
 
@@ -229,11 +251,12 @@ async function detectFrame(landmarker, index, source) {
   const t = (index + TUNING.frameSamplePhase) * source.frameStep
   video.currentTime = t
   await waitForEvent(video, 'seeked', TUNING.seekTimeoutMs, `seek to ${t.toFixed(3)}s`)
-  await waitForPresentedFrame()
+  await settleFrame()
+  canvasCtx.drawImage(video, 0, 0, canvas.width, canvas.height)
 
   // Strictly increasing, derived from the sample time so it matches the media clock.
   const timestampMs = Math.round(t * 1000)
-  const result = landmarker.detectForVideo(video, timestampMs)
+  const result = landmarker.detectForVideo(canvas, timestampMs)
   const landmarks = result?.landmarks?.[0]
   if (!Array.isArray(landmarks) || landmarks.length !== EXPECTED_LANDMARKS) return null
   return { i: index, t: round(t, 6), tsMs: timestampMs, lm: compactLandmarks(landmarks) }

@@ -21,6 +21,52 @@
    system and it has to stay scannable in a hurry.
    ========================================================================== */
 
+/* ------------------------------------------------------------- display face */
+/* ONE display face beside the system UI stack, used only for the wordmark, the
+   intro headline and the persona names. Every number stays system-ui, tabular.
+
+   SELF-HOSTED, NOT A CDN. Venue wifi is a planned failure mode — the MediaPipe
+   model and its wasm are vendored locally for exactly this reason — so the shipped
+   app makes no font request over the network. Vite fingerprints these two files
+   into dist/assets from src/ui/fonts/. Clash Display, ITF Free Font License.
+
+   The fallback stack is the face the type scale was fitted against (SF Pro Display
+   on Apple hardware, system-ui elsewhere), so a missing woff2 degrades the
+   headline's character without touching the layout. */
+@font-face {
+  font-family: 'Clash Display';
+  src: url('./ui/fonts/ClashDisplay-Semibold.woff2') format('woff2');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Clash Display';
+  src: url('./ui/fonts/ClashDisplay-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* Registering the accents as <color> makes them INTERPOLATE, so the persona retint
+   is one animation instead of N transitions that drift apart. --accent-far is the
+   second radial in the intro's atmosphere; nothing else reads it.
+   NOTE: --accent-rgb below is deliberately NOT registered — it is a channel list
+   for rgb(... / a), not a colour, and it cannot interpolate. Inside the intro,
+   use var(--accent) with color-mix() so the whole screen retints together. */
+@property --accent {
+  syntax: '<color>';
+  inherits: true;
+  initial-value: #f2f6fc;
+}
+
+@property --accent-far {
+  syntax: '<color>';
+  inherits: true;
+  initial-value: #f2f6fc;
+}
+
 :root {
   --substrate: #05070a;
   --ink: #f2f6fc;
@@ -48,6 +94,11 @@
 
   --font-ui: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
   --font-serif: 'Iowan Old Style', 'Palatino Linotype', Palatino, 'Times New Roman', Georgia, serif;
+  --font-display: 'Clash Display', 'SF Pro Display', system-ui, -apple-system, sans-serif;
+
+  /* The one easing curve. Previously inlined at each call site; both spellings are
+     the same curve, and new rules should use the token. */
+  --ease: cubic-bezier(0.32, 0.72, 0, 1);
 
   --gutter: clamp(14px, 2.4vw, 28px);
   --numeral: clamp(56px, 11.5vw, 104px);
@@ -58,16 +109,29 @@
 
   /* Neutral default so nothing depends on a persona being resolved. */
   --accent: #f2f6fc;
+  --accent-far: #f2f6fc;
   --accent-rgb: 242 246 252;
 }
 
 /* Persona hues, applied by attribute so a per-persona chip or card can carry its
    OWN hue locally while the app root carries the ACTIVE one. Deliberately NOT
    personas.ts accentColor: that file's `mean` is #FF4438, close enough to --fault
-   to blur the one distinction the fault slab exists to make. */
-[data-persona='mean'] { --accent: #ff8a1f; --accent-rgb: 255 138 31; }
-[data-persona='nice'] { --accent: #2fe0a8; --accent-rgb: 47 224 168; }
-[data-persona='sarcastic'] { --accent: #b388ff; --accent-rgb: 179 136 255; }
+   to blur the one distinction the fault slab exists to make.
+
+   --accent-far is the SECOND hue of each persona's pair, used only by the intro
+   atmosphere's far radial. It is held a clear step around the wheel from --accent so
+   the gradient reads as depth rather than as a second brand colour. */
+[data-persona='mean'] { --accent: #ff8a1f; --accent-far: #ff4438; --accent-rgb: 255 138 31; }
+[data-persona='nice'] { --accent: #2fe0a8; --accent-far: #3ac8ff; --accent-rgb: 47 224 168; }
+[data-persona='sarcastic'] { --accent: #b388ff; --accent-far: #ff7ad9; --accent-rgb: 179 136 255; }
+
+/* The retint itself, and the reason the accents are registered above: ONE
+   declaration cross-fades the headline, the orbs, the panel glow, the CTA and the
+   cards together. Scoped to the intro so the workout screen's rim light keeps its
+   existing instant response to a mid-set persona swap. */
+.app[data-screen='intro'] {
+  transition: --accent 620ms var(--ease), --accent-far 620ms var(--ease);
+}
 
 *, *::before, *::after { box-sizing: border-box; }
 html, body, #root { height: 100%; }
@@ -98,133 +162,856 @@ body {
 }
 
 /* ------------------------------------------------------------ intro screen */
+/* DIRECTION B, "Apple product page". Ported from the approved prototype. Doctrine
+   for this block, on top of the file's:
 
-.intro { position: absolute; inset: 0; }
+   1. THE TYPE SCALE IS CLOSED. Only the --fs-* tokens below. No arbitrary px.
+   2. TRACKING IS A FUNCTION OF SIZE. Display type gets NEGATIVE tracking
+      (--tr-display); caps micro-labels get POSITIVE (--tr-caps). Nothing ships at 0
+      by accident.
+   3. MATERIAL, NOT SHADOW — and it is the file's ONE glass recipe (--glass-*), not a
+      second one. Concentric radii: 32px panel, 22px stage, 10px of padding between
+      them, so the corners stay parallel.
+   4. HUE IS STILL A CHANNEL. The intro carries persona colour because it is all
+      frame; it never paints a numeral. Inside this block use var(--accent) with
+      color-mix() rather than --accent-rgb, so everything interpolates on a swap.
+   5. Every rule here is scoped under .intro. The workout screen shares .glass and
+      the tokens, and nothing else. */
 
-.intro__video,
-.intro__poster { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
-
-.intro__poster {
-  display: grid;
-  place-items: center;
-  background:
-    radial-gradient(120% 90% at 50% 18%, rgb(var(--accent-rgb) / 0.22), transparent 62%),
-    var(--substrate);
-}
-
-.intro__posterName {
-  font-size: clamp(28px, 7vw, 76px);
-  font-weight: 800;
-  letter-spacing: -0.02em;
-  color: rgb(var(--accent-rgb) / 0.82);
-}
-
-.intro__scrim {
+.intro {
   position: absolute;
   inset: 0;
-  background: linear-gradient(
-    to top,
-    rgba(5, 7, 10, 0.95) 0%,
-    rgba(5, 7, 10, 0.74) 32%,
-    rgba(5, 7, 10, 0.08) 66%,
-    rgba(5, 7, 10, 0.38) 100%
-  );
+  /* The product page is taller than the fold on a phone; .app clips, so the intro
+     is the scroll container. contain, so a rubber-band never moves the page. */
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  font-size: var(--fs-15);
+  letter-spacing: var(--tr-body);
+
+  /* Closed type scale, ~1.28 ratio. */
+  --fs-10: 10px;
+  --fs-11: 11px;
+  --fs-13: 13px;
+  --fs-15: 15px;
+  --fs-17: 17px;
+  --fs-21: 21px;
+  --fs-26: 26px;
+  --fs-display: clamp(38px, 4.9vw, 72px);
+
+  /* Tracking, declared per rung. */
+  --tr-caps: 0.24em;
+  --tr-caps-2: 0.15em;
+  --tr-display: -0.035em;
+  --tr-title: -0.02em;
+  --tr-body: -0.006em;
+
+  --hairline-2: rgba(255, 255, 255, 0.13);
+  --inset-hi: inset 0 1px 0 rgba(255, 255, 255, 0.16);
+  --lift: 0 30px 80px -30px rgba(0, 0, 0, 0.82);
+
+  --r-panel: 32px;
+  --r-stage: 22px;
+
+  --page-x: clamp(20px, 4.4vw, 64px);
+  --maxw: 1280px;
+
+  /* The avatar source is square, so the stage is square by construction — capped by
+     viewport HEIGHT as well as width so the fold never breaks at 1440x900. */
+  --panel-w: clamp(240px, min(32vw, 42dvh), 420px);
+
+  /* THE AI WATERMARK CROP. All three baked clips burn "This digital avatar is
+     generated by AI" across source y 93-99%. Blowing the clip up to 112% and
+     anchoring it to the TOP of the square cell pushes that strip past the bottom
+     edge (93% x 112% = 104%) and leaves the eyeline at ~44%. See AvatarStage.tsx.
+     Lower this number and the watermark comes back. */
+  --avatar-crop: 112%;
 }
 
-/* Sits top-right, clear of the wordmark and the persona cards. Only rendered
-   while the intro is still muted — once sound is earned it never returns. */
-.intro__unmute {
+/* ----------------------------------------------------------- atmosphere */
+/* Never a flat fill: two persona-tinted radials, two breathing orbs, a vignette
+   that pulls the corners down, grain over the top. */
+.intro .atmos { position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden; }
+
+.intro .atmos__base {
   position: absolute;
-  top: calc(env(safe-area-inset-top) + 20px);
-  right: calc(env(safe-area-inset-right) + 20px);
-  z-index: 3;
+  inset: -10%;
+  background:
+    radial-gradient(70% 55% at 76% -6%, color-mix(in oklab, var(--accent) 17%, transparent), transparent 66%),
+    radial-gradient(64% 52% at 2% 104%, color-mix(in oklab, var(--accent-far) 13%, transparent), transparent 64%),
+    linear-gradient(180deg, #080b11 0%, #05070a 48%, #04060a 100%);
+}
+
+.intro .atmos__orb {
+  position: absolute;
+  width: min(62vw, 820px);
+  aspect-ratio: 1;
+  right: -8vw;
+  top: -14vh;
+  border-radius: 50%;
+  background: radial-gradient(circle, color-mix(in oklab, var(--accent) 22%, transparent) 0%, transparent 62%);
+  filter: blur(28px);
+  animation: introOrb 17s ease-in-out infinite alternate;
+}
+
+.intro .atmos__orb--b {
+  right: auto;
+  left: -16vw;
+  top: auto;
+  bottom: -24vh;
+  width: min(52vw, 680px);
+  background: radial-gradient(circle, color-mix(in oklab, var(--accent-far) 15%, transparent) 0%, transparent 64%);
+  animation-duration: 23s;
+  animation-direction: alternate-reverse;
+}
+
+.intro .atmos__vig {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(118% 96% at 50% 40%, transparent 34%, rgba(2, 3, 6, 0.58) 86%, rgba(2, 3, 6, 0.78) 100%);
+}
+
+.intro .grain {
+  position: fixed;
+  inset: 0;
+  z-index: 9;
+  pointer-events: none;
+  opacity: 0.042;
+  mix-blend-mode: overlay;
+  background-size: 170px 170px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='170' height='170'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.82' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='170' height='170' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* ------------------------------------------------------------------- nav */
+.intro .nav {
+  position: relative;
+  z-index: 2;
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--glass-border);
+  background: rgba(6, 8, 12, 0.44);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  padding-top: env(safe-area-inset-top);
+}
+
+.intro .nav__in {
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding: 13px var(--page-x);
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.intro .wordmark {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: var(--fs-17);
+  letter-spacing: 0.02em;
+  line-height: 1;
+}
+
+.intro .wordmark b { color: var(--accent); font-weight: inherit; }
+.intro .nav__spacer { flex: 1; }
+
+.intro .nav__meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: var(--fs-10);
+  letter-spacing: var(--tr-caps-2);
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.intro .pill {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 10px 16px;
+  gap: 6px;
+  padding: 4px 9px 4px 8px;
   border-radius: 999px;
-  font: inherit;
-  font-size: 13px;
-  font-weight: 600;
-  letter-spacing: 0.01em;
-  color: var(--ink);
-  cursor: pointer;
-  animation: introUnmuteIn 460ms cubic-bezier(0.32, 0.72, 0, 1) 700ms both;
-  transition: transform 180ms cubic-bezier(0.32, 0.72, 0, 1), opacity 180ms linear;
+  border: 1px solid var(--hairline-2);
+  background: rgba(255, 255, 255, 0.04);
+  box-shadow: var(--inset-hi);
 }
 
-.intro__unmute:hover { transform: scale(1.03); }
-.intro__unmute:active { transform: scale(0.98); }
+.intro .pill__dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 8px color-mix(in oklab, var(--accent) 80%, transparent);
+}
 
-@keyframes introUnmuteIn {
-  from { opacity: 0; transform: translateY(-6px); }
+/* ----------------------------------------------------------------- shell */
+.intro .shell {
+  position: relative;
+  z-index: 2;
+  flex: 1;
+  width: 100%;
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding:
+    clamp(24px, 3.6vh, 48px)
+    var(--page-x)
+    calc(clamp(20px, 2.8vh, 34px) + env(safe-area-inset-bottom));
+  display: grid;
+  grid-template-rows: 1fr auto;
+  gap: clamp(26px, 4vh, 52px);
+}
+
+.intro .hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1.04fr) minmax(0, 0.96fr);
+  gap: clamp(28px, 4vw, 72px);
+  align-items: start;
+  align-content: center;
+}
+
+.intro .copy { display: flex; flex-direction: column; align-items: flex-start; }
+
+/* ------------------------------------------------------------------ lede */
+.intro .eyebrow {
+  margin: 0 0 clamp(14px, 1.8vh, 22px);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: var(--fs-11);
+  font-weight: 600;
+  letter-spacing: var(--tr-caps);
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+/* Caps at 11px need MORE tracking than the label beside them, not the same. */
+.intro .eyebrow em { font-style: normal; color: var(--accent); letter-spacing: calc(var(--tr-caps) + 0.02em); }
+.intro .eyebrow i { display: block; width: 22px; height: 1px; background: var(--hairline-2); }
+
+.intro .headline {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: var(--fs-display);
+  line-height: 0.95;
+  letter-spacing: var(--tr-display);
+  text-wrap: balance;
+}
+
+/* Each line is a clipping mask, so the entrance rises out of its own baseline. The
+   nowrap is load-bearing: a line that wrapped inside its own mask would reveal both
+   halves on one transform and the rag would stop being a decision. */
+.intro .line {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  padding-bottom: 0.09em;
+  margin-bottom: -0.09em;
+}
+
+.intro .line > span { display: block; animation: introRise 560ms var(--ease) both; animation-delay: var(--d, 0ms); }
+.intro .line--accent > span { color: var(--accent); }
+
+.intro .deck {
+  margin: clamp(16px, 2.2vh, 26px) 0 0;
+  max-width: 33rem;
+  font-size: var(--fs-17);
+  line-height: 1.47;
+  letter-spacing: var(--tr-body);
+  color: var(--ink-dim);
+}
+
+.intro .deck b { color: var(--ink); font-weight: 600; }
+
+/* ------------------------------------------------------------------- CTA */
+.intro .actions {
+  margin-top: clamp(22px, 3vh, 34px);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.intro .cta {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 26px 16px 28px;
+  border: 0;
+  border-radius: 999px;
+  font-size: var(--fs-17);
+  font-weight: 600;
+  letter-spacing: -0.008em;
+  color: #06080b;
+  background: var(--accent);
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  box-shadow:
+    var(--inset-hi),
+    0 18px 44px -18px color-mix(in oklab, var(--accent) 85%, transparent),
+    0 2px 10px -2px rgba(0, 0, 0, 0.5);
+  transition: transform 260ms var(--ease), box-shadow 260ms var(--ease), background 620ms var(--ease);
+}
+
+.intro .cta:hover {
+  transform: translateY(-1px);
+  box-shadow:
+    var(--inset-hi),
+    0 24px 56px -18px color-mix(in oklab, var(--accent) 95%, transparent),
+    0 2px 10px -2px rgba(0, 0, 0, 0.5);
+}
+
+.intro .cta:active { transform: translateY(1px) scale(0.994); }
+
+/* The primary action needs a focus ring more than anything else on the screen. */
+.intro .cta:focus-visible {
+  outline: none;
+  box-shadow:
+    var(--inset-hi),
+    0 0 0 2px var(--substrate),
+    0 0 0 4px color-mix(in oklab, var(--accent) 80%, transparent),
+    0 18px 44px -18px color-mix(in oklab, var(--accent) 85%, transparent);
+}
+
+.intro .cta__arrow {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: rgba(6, 8, 11, 0.14);
+  transition: transform 300ms var(--ease);
+}
+
+.intro .cta:hover .cta__arrow { transform: translateX(3px); }
+.intro .cta svg { width: 11px; height: 11px; }
+
+.intro .metaline {
+  margin: 0;
+  font-size: var(--fs-13);
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.002em;
+}
+
+/* A separator, not an element with meaning — generated, so it stays out of the
+   accessibility tree and out of a copy-paste. */
+.intro .metaline span + span::before { content: '·'; padding: 0 7px; color: rgba(242, 246, 252, 0.24); }
+
+.intro .status {
+  margin: 0;
+  min-height: 1.2em;
+  font-size: var(--fs-13);
+  letter-spacing: -0.002em;
+  color: var(--accent);
+  opacity: 0;
+  transform: translateY(-3px);
+  transition: opacity 340ms var(--ease), transform 340ms var(--ease);
+}
+
+.intro .status[data-on='true'] { opacity: 1; transform: none; }
+
+/* ------------------------------------------------------------ spec strip */
+.intro .specs {
+  margin: auto 0 0;
+  padding-top: clamp(20px, 2.8vh, 30px);
+  display: flex;
+  align-items: flex-start;
+  gap: clamp(18px, 2.4vw, 34px);
+  border-top: 1px solid var(--glass-border);
+  width: 100%;
+}
+
+/* column-reverse: the DOM keeps dt-then-dd (a description list has to), the eye
+   gets value-then-label. */
+.intro .spec { display: flex; flex-direction: column-reverse; gap: 5px; }
+
+.intro .spec__v {
+  margin: 0;
+  font-size: var(--fs-21);
+  font-weight: 600;
+  letter-spacing: var(--tr-title);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
+
+.intro .spec__u { margin-left: 2px; font-size: var(--fs-13); font-weight: 500; letter-spacing: 0; color: var(--ink-faint); }
+.intro .spec__k { font-size: var(--fs-10); letter-spacing: var(--tr-caps-2); text-transform: uppercase; color: var(--ink-faint); }
+
+/* ----------------------------------------------------------- hero object */
+.intro .stagewrap { display: flex; justify-content: flex-end; }
+
+/* Floats off-grid: lifts above the headline's cap line and bleeds past the right
+   column edge into the page gutter. */
+.intro .panel {
+  position: relative;
+  width: calc(var(--panel-w) + 20px);
+  margin: clamp(-46px, -2.6vw, -10px) clamp(-30px, -1.7vw, 0px) 0 0;
+  padding: 10px;
+  border-radius: var(--r-panel);
+  border: 1px solid var(--glass-border);
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow:
+    var(--lift),
+    var(--inset-hi),
+    0 0 90px -30px color-mix(in oklab, var(--accent) 55%, transparent);
+  transition: box-shadow 620ms var(--ease);
+}
+
+/* The tell while an incoming clip is still decoding its first frame. */
+.intro .panel[data-loading='true'] {
+  box-shadow: var(--lift), var(--inset-hi), 0 0 110px -26px color-mix(in oklab, var(--accent) 80%, transparent);
+}
+
+.intro .stage {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1; /* 640x640 source. Square, never 16:9. */
+  border-radius: var(--r-stage);
+  overflow: hidden;
+  background: #04060a;
+  isolation: isolate;
+}
+
+/* --avatar-crop, anchored top, is the watermark crop. `cover` then trims ~5% off
+   each side, which a centred talking head can spare. */
+.intro .stage__video {
+  position: absolute;
+  inset: 0 0 auto 0;
+  width: 100%;
+  height: var(--avatar-crop);
+  object-fit: cover;
+  opacity: 0;
+  transform: scale(1.025);
+  transition: opacity 560ms var(--ease), transform 900ms var(--ease);
+}
+
+.intro .stage__video[data-front='true'] { opacity: 1; transform: none; }
+
+.intro .stage__fallback {
+  position: absolute;
+  inset: 0;
+  display: none;
+  place-items: center;
+  padding: 18px;
+  text-align: center;
+  background:
+    radial-gradient(90% 70% at 50% 24%, color-mix(in oklab, var(--accent) 30%, transparent), transparent 66%),
+    #06080c;
+}
+
+.intro .stage[data-failed='true'] .stage__fallback { display: grid; }
+
+.intro .stage__fallbackName {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: var(--fs-26);
+  letter-spacing: var(--tr-title);
+  color: color-mix(in oklab, var(--accent) 86%, white);
+}
+
+.intro .stage__fallbackNote {
+  margin: 8px 0 0;
+  font-size: var(--fs-11);
+  letter-spacing: var(--tr-caps-2);
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+/* Rim + top-down scrim keep the badge legible over a bright frame. */
+.intro .stage__rim {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border-radius: inherit;
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
+    inset 0 0 70px -20px color-mix(in oklab, var(--accent) 60%, transparent);
+}
+
+.intro .stage__scrim {
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 34%;
+  pointer-events: none;
+  background: linear-gradient(180deg, rgba(3, 5, 8, 0.62), transparent);
+}
+
+.intro .badge {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 11px 6px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--hairline-2);
+  background: rgba(8, 10, 14, 0.5);
+  backdrop-filter: blur(14px) saturate(140%);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  box-shadow: var(--inset-hi);
+  font-size: var(--fs-10);
+  font-weight: 600;
+  letter-spacing: var(--tr-caps-2);
+  text-transform: uppercase;
+  color: var(--ink);
+}
+
+.intro .badge__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 10px color-mix(in oklab, var(--accent) 90%, transparent);
+}
+
+/* ------------------------------------------------------------- meter row */
+.intro .meter {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 4px 3px;
+}
+
+.intro .track { height: 2px; border-radius: 2px; background: rgba(255, 255, 255, 0.11); overflow: hidden; }
+
+.intro .track__fill {
+  width: 0%;
+  height: 100%;
+  background: var(--accent);
+  box-shadow: 0 0 10px color-mix(in oklab, var(--accent) 70%, transparent);
+  transition: width 120ms linear, background 620ms var(--ease);
+}
+
+.intro .time {
+  font-size: var(--fs-11);
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+  letter-spacing: 0.02em;
+}
+
+/* The sound affordance IS the muted pill: it invites the gesture that earns audio,
+   and becomes a plain status the moment audio is earned. */
+.intro .sound {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  background: none;
+  font-size: var(--fs-10);
+  font-weight: 600;
+  letter-spacing: var(--tr-caps-2);
+  text-transform: uppercase;
+  color: var(--ink-dim);
+  cursor: pointer;
+  transition: color 240ms var(--ease);
+}
+
+.intro .sound:hover { color: var(--ink); }
+.intro .sound:disabled { cursor: default; color: var(--accent); }
+.intro .sound__dot { width: 5px; height: 5px; border-radius: 50%; background: rgba(242, 246, 252, 0.34); }
+
+.intro .sound[data-on='true'] .sound__dot {
+  background: var(--accent);
+  box-shadow: 0 0 8px color-mix(in oklab, var(--accent) 90%, transparent);
+  animation: introBlip 1.6s var(--ease) infinite;
+}
+
+/* ----------------------------------------------------------- quote card */
+/* Same border-inline-start rule as the workout screen's captions. */
+.intro .caption {
+  margin: 8px 0 0;
+  padding: 12px 4px 4px 13px;
+  border-top: 1px solid var(--glass-border);
+  border-inline-start: 2px solid color-mix(in oklab, var(--accent) 88%, transparent);
+  border-top-left-radius: 2px;
+}
+
+.intro .caption__k {
+  display: block;
+  margin-bottom: 6px;
+  font-size: var(--fs-10);
+  letter-spacing: var(--tr-caps);
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.intro .caption__q {
+  margin: 0;
+  min-height: 2.8em;
+  font-size: var(--fs-15);
+  line-height: 1.4;
+  letter-spacing: var(--tr-body);
+  color: var(--ink);
+  animation: introQuote 420ms var(--ease) both;
+}
+
+/* --------------------------------------------------------- persona cards */
+.intro .picker { display: grid; gap: clamp(14px, 1.8vh, 20px); }
+
+.intro .picker__head {
+  margin: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  font-size: var(--fs-10);
+  letter-spacing: var(--tr-caps);
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.intro .picker__head i { flex: 1; height: 1px; background: var(--glass-border); }
+.intro .keys { display: inline-flex; align-items: center; gap: 6px; letter-spacing: var(--tr-caps-2); }
+
+/* A keyboard hint on a touch device is a lie. */
+@media (hover: none) and (pointer: coarse) {
+  .intro .keys { display: none; }
+}
+
+.intro kbd {
+  display: inline-grid;
+  place-items: center;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 4px;
+  border: 1px solid var(--hairline-2);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.05);
+  box-shadow: var(--inset-hi);
+  font-family: var(--font-ui);
+  font-size: var(--fs-10);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+  color: var(--ink-dim);
+}
+
+.intro .cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: clamp(12px, 1.2vw, 18px); }
+
+.intro .card {
+  position: relative;
+  overflow: hidden;
+  display: grid;
+  padding: 16px 19px 15px;
+  text-align: left;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  border-radius: var(--radius);
+  border: 1px solid var(--glass-border);
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--inset-hi), 0 16px 40px -28px rgba(0, 0, 0, 0.9);
+  color: var(--ink);
+  opacity: 0.56;
+  transition:
+    opacity 420ms var(--ease),
+    transform 480ms var(--ease),
+    border-color 480ms var(--ease),
+    box-shadow 480ms var(--ease);
+}
+
+/* Each card carries its own persona hue at all times — that is what teaches the
+   mapping. The hue itself comes from the [data-persona] block near the top. */
+.intro .card::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(120% 90% at 8% -10%, color-mix(in oklab, var(--accent) 16%, transparent), transparent 62%);
+  opacity: 0;
+  transition: opacity 480ms var(--ease);
+}
+
+.intro .card:hover { opacity: 0.82; transform: translateY(-2px); }
+
+.intro .card:focus-visible {
+  outline: none;
+  opacity: 1;
+  box-shadow: var(--inset-hi), 0 0 0 2px color-mix(in oklab, var(--accent) 70%, transparent);
+}
+
+.intro .card[aria-checked='true'] {
+  opacity: 1;
+  transform: translateY(-7px);
+  border-color: color-mix(in oklab, var(--accent) 52%, transparent);
+  box-shadow:
+    var(--inset-hi),
+    0 0 0 1px color-mix(in oklab, var(--accent) 34%, transparent),
+    0 34px 70px -34px color-mix(in oklab, var(--accent) 80%, transparent),
+    0 18px 50px -30px rgba(0, 0, 0, 0.9);
+}
+
+.intro .card[aria-checked='true']::after { opacity: 1; }
+
+.intro .card__top { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 11px; }
+
+.intro .card__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: color-mix(in oklab, var(--accent) 55%, transparent);
+  transition: background 480ms var(--ease), box-shadow 480ms var(--ease);
+}
+
+.intro .card[aria-checked='true'] .card__dot {
+  background: var(--accent);
+  box-shadow: 0 0 12px color-mix(in oklab, var(--accent) 90%, transparent);
+}
+
+.intro .card__super { font-size: var(--fs-10); letter-spacing: var(--tr-caps); text-transform: uppercase; color: var(--ink-faint); }
+.intro .card[aria-checked='true'] .card__super { color: color-mix(in oklab, var(--accent) 75%, white); }
+
+.intro .card__name {
+  display: block;
+  margin: 2px 0 8px;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: var(--fs-26);
+  line-height: 1;
+  letter-spacing: var(--tr-title);
+  transition: color 480ms var(--ease);
+}
+
+.intro .card[aria-checked='true'] .card__name { color: var(--accent); }
+.intro .card__line { font-size: var(--fs-13); line-height: 1.4; letter-spacing: var(--tr-body); color: var(--ink-dim); }
+
+.intro .card__state {
+  margin-top: 11px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: var(--fs-10);
+  letter-spacing: var(--tr-caps-2);
+  text-transform: uppercase;
+  color: rgba(242, 246, 252, 0.24);
+}
+
+.intro .card[aria-checked='true'] .card__state { color: color-mix(in oklab, var(--accent) 80%, white); }
+
+.intro .card__check {
+  display: grid;
+  place-items: center;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 1px solid currentColor;
+}
+
+.intro .card__check svg { width: 7px; height: 7px; opacity: 0; transition: opacity 300ms var(--ease); }
+.intro .card[aria-checked='true'] .card__check { background: var(--accent); border-color: var(--accent); color: #06080b; }
+.intro .card[aria-checked='true'] .card__check svg { opacity: 1; }
+
+/* -------------------------------------------------------------- entrance */
+/* ONE entrance. The clock is introMotion.ts; the curve and the distance are here. */
+/* animation-delay is repeated on the two variants ON PURPOSE. They are the same
+   specificity as the base rule, so their `animation` shorthand resets the delay to
+   0 — which silently dropped the avatar panel's 170ms beat in the prototype. */
+.intro [data-reveal] { animation: introReveal 480ms var(--ease) both; animation-delay: var(--d, 0ms); }
+.intro [data-reveal='object'] { animation: introRevealObject 620ms var(--ease) both; animation-delay: var(--d, 0ms); }
+.intro [data-reveal='fade'] { animation: introFade 620ms var(--ease) both; animation-delay: var(--d, 0ms); }
+
+@keyframes introReveal {
+  from { opacity: 0; transform: translate3d(0, 14px, 0); }
   to { opacity: 1; transform: none; }
 }
 
+@keyframes introRevealObject {
+  from { opacity: 0; transform: translate3d(0, 22px, 0) scale(0.965); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes introFade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes introRise {
+  from { transform: translate3d(0, 106%, 0); }
+  to { transform: none; }
+}
+
+@keyframes introQuote {
+  from { opacity: 0; transform: translateY(5px); }
+  to { opacity: 1; transform: none; }
+}
+
+@keyframes introOrb {
+  from { transform: translate3d(0, 0, 0) scale(1); opacity: 0.72; }
+  to { transform: translate3d(-3vw, 4vh, 0) scale(1.1); opacity: 1; }
+}
+
+@keyframes introBlip {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+/* ------------------------------------------------------ intro responsive */
+/* Laptop-narrow: stack the object under the copy, keep it left-aligned. */
+@media (max-width: 1040px) {
+  .intro { --panel-w: min(66vw, 40dvh); }
+  .intro .hero { grid-template-columns: minmax(0, 1fr); gap: clamp(26px, 3.4vh, 40px); }
+  .intro .stagewrap { justify-content: flex-start; }
+  .intro .panel { margin: 0; width: min(100%, calc(var(--panel-w) + 20px)); }
+  .intro .specs { margin-top: clamp(22px, 3vh, 32px); }
+}
+
+/* Phone. --panel-w is deliberately NOT overridden: the object takes the full column
+   and the square aspect-ratio sets its height. */
+@media (max-width: 720px) {
+  .intro { --page-x: 20px; --fs-display: clamp(36px, 10.4vw, 52px); }
+  .intro .shell { grid-template-rows: auto auto; gap: 32px; padding-top: 24px; }
+
+  /* A real reorder, not a reflow accident: the avatar has to arrive BEFORE the deck
+     and the CTA or the thing the screen is about sits below the fold. display:
+     contents lifts the copy's children into the hero's flex flow so the object can
+     be interleaved between them. */
+  .intro .hero { display: flex; flex-direction: column; align-items: stretch; gap: 22px; }
+  .intro .copy { display: contents; }
+  .intro .eyebrow { order: 1; margin-bottom: 0; font-size: var(--fs-10); letter-spacing: 0.14em; gap: 8px; white-space: nowrap; }
+  .intro .eyebrow em { letter-spacing: 0.16em; }
+  .intro .headline { order: 2; }
+  .intro .stagewrap { order: 3; justify-content: center; }
+  .intro .deck { order: 4; margin-top: 0; max-width: none; font-size: var(--fs-15); }
+  .intro .actions { order: 5; margin-top: 0; align-self: stretch; width: 100%; }
+  .intro .specs { order: 6; margin-top: 0; padding-top: 20px; }
+
+  .intro .cta { width: 100%; justify-content: center; padding: 17px 24px; }
+  .intro .panel { width: 100%; }
+  .intro .cards { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .intro .card { padding: 15px 17px; opacity: 0.62; }
+  .intro .card:hover { transform: none; }
+  .intro .card[aria-checked='true'] { transform: translateY(-2px); }
+  .intro .card__top { margin-bottom: 9px; }
+  .intro .card__name { font-size: var(--fs-21); margin-bottom: 5px; }
+  .intro .card__state { margin-top: 10px; }
+  .intro .specs { gap: 22px; flex-wrap: wrap; }
+  .intro .nav__meta .pill--hide { display: none; }
+}
+
+@media (max-width: 380px) {
+  .intro .specs .spec:last-child { display: none; }
+}
+
+/* This file ends with a global prefers-reduced-motion reset that flattens every
+   animation and transition to ~0ms, so none of that is repeated here — every
+   entrance above uses `both`, so it lands on its end state instead of vanishing.
+   What the reset cannot express is a STATIC end state: an orb that no longer
+   breathes still has to be visible, and its keyframes carried its opacity. */
 @media (prefers-reduced-motion: reduce) {
-  .intro__unmute { animation: none; transition: none; }
+  .intro .atmos__orb { animation: none; opacity: 0.85; }
 }
-
-.intro__content {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 18px;
-  padding:
-    calc(var(--gutter) + env(safe-area-inset-top))
-    calc(var(--gutter) + env(safe-area-inset-right))
-    calc(var(--gutter) + env(safe-area-inset-bottom))
-    calc(var(--gutter) + env(safe-area-inset-left));
-}
-
-.intro__brand { flex: 0 0 auto; }
-.intro__wordmark { margin: 0; font-size: clamp(22px, 3.4vw, 34px); font-weight: 800; letter-spacing: 0.3em; }
-.intro__tagline { margin: 8px 0 0; font-size: 15px; color: var(--ink-dim); }
-.intro__pick { margin-top: auto; }
-.intro__prompt { margin: 0 0 10px; font-size: 11px; letter-spacing: 0.22em; color: var(--ink-faint); }
-.intro__cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(212px, 1fr)); gap: 12px; }
-
-.card {
-  display: grid;
-  gap: 6px;
-  padding: 15px 17px;
-  text-align: left;
-  color: var(--ink);
-  cursor: pointer;
-  transition: border-color 140ms ease, box-shadow 140ms ease;
-}
-
-.card__key { font-size: 10px; letter-spacing: 0.2em; color: var(--ink-faint); }
-.card__name { font-size: clamp(15px, 1.6vw, 18px); font-weight: 700; letter-spacing: 0.08em; }
-.card__tagline { font-size: 13px; line-height: 1.35; color: var(--ink-dim); }
-
-.card[data-active='true'] {
-  border-color: rgb(var(--accent-rgb) / 0.7);
-  box-shadow:
-    var(--glass-shadow),
-    0 0 0 1px rgb(var(--accent-rgb) / 0.4),
-    0 14px 44px -14px rgb(var(--accent-rgb) / 0.6);
-}
-
-.card[data-active='true'] .card__name { color: var(--accent); }
-.intro__go { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; }
-
-.start {
-  padding: 18px 34px;
-  border: 0;
-  border-radius: 999px;
-  font-size: clamp(16px, 2vw, 20px);
-  font-weight: 800;
-  letter-spacing: 0.12em;
-  color: #07090c;
-  background: var(--accent);
-  cursor: pointer;
-  box-shadow: 0 18px 48px -18px rgb(var(--accent-rgb) / 0.8);
-}
-
-.start:active { transform: translateY(1px); }
-.intro__note { margin: 0; font-size: 12px; color: var(--ink-faint); }
 
 /* ---------------------------------------------------------- workout screen */
 
@@ -637,9 +1424,7 @@ body {
   .refclip { grid-template-columns: 116px 1fr; }
   .refclip__video,
   .refclip__fallback { width: 116px; }
-  .intro__cards { grid-template-columns: 1fr; }
-  .card { padding: 12px 15px; }
-  .start { width: 100%; text-align: center; }
+  /* The intro's own narrow-screen rules live with the intro, in its block above. */
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -648,4 +1433,87 @@ body {
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
   }
+}
+
+/* ============================================================================
+   TWO-WAY VOICE INDICATORS — appended block (mic uplink + music)
+
+   Both live inside .hud__strip, so they inherit its 10px / 0.16em / --ink-dim
+   treatment and stay in the "what is the machine doing" row beside COACH LIVE.
+   That is also what keeps them subordinate: nothing here competes with the rep
+   numeral, which is ~10x the type size.
+
+   Hue budget, against the doctrine at the top of this file:
+     - metric hues are legal here because this IS inside the glass HUD;
+     - LISTENING borrows --metric-ok, the same green as the live connection dot,
+       because it means the same thing — the link is up;
+     - MUTED is neutral on purpose. The mic closing while the coach talks is the
+       design working, not a fault, and colouring it would teach the user to read
+       an expected state as a problem;
+     - OFF/DENIED is --metric-warn, NOT --fault. The app is degraded, not wrong:
+       pose coaching is unaffected. --fault is reserved for a form fault, and a red
+       pill mid-set would read as "your form is broken".
+   ========================================================================== */
+
+.hud__mic,
+.hud__music {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  /* Inherited from .hud__strip: font-size 10px, letter-spacing 0.16em. */
+  white-space: nowrap;
+}
+
+.hud__micLabel { line-height: 1; }
+
+/* Three bars rather than a dot: a dot answers "is the mic on", and the question a
+   user on the floor actually has is "is it hearing ME". */
+.hud__micMeter {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 9px;
+}
+
+.hud__micBar {
+  width: 2px;
+  border-radius: 1px;
+  background: var(--ink-faint);
+}
+
+/* Ascending heights, so the meter reads as a level even before any bar lights. */
+.hud__micBar:nth-child(1) { height: 3px; }
+.hud__micBar:nth-child(2) { height: 6px; }
+.hud__micBar:nth-child(3) { height: 9px; }
+
+.hud__mic[data-mic='listening'] { color: var(--metric-ok); border-color: rgb(50 215 75 / 0.42); }
+.hud__mic[data-mic='listening'] .hud__micBar[data-lit='true'] {
+  background: var(--metric-ok);
+  box-shadow: 0 0 6px var(--metric-ok);
+}
+
+.hud__mic[data-mic='muted'] { color: var(--ink-dim); }
+.hud__mic[data-mic='muted'] .hud__micBar { background: rgba(242, 246, 252, 0.18); }
+
+.hud__mic[data-mic='off'] { color: var(--metric-warn); border-color: rgb(255 176 32 / 0.45); }
+.hud__mic[data-mic='off'] .hud__micBar { background: rgb(255 176 32 / 0.34); }
+
+/* Neutral, and it renders only while a track is actually playing — an idle music
+   indicator is a permanent extra object on screen that says nothing. */
+.hud__music { color: var(--ink-dim); }
+
+/* The pill labels are abbreviations; the full sentence is for assistive tech only. */
+.hud__srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }

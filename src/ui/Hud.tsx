@@ -15,6 +15,9 @@
  */
 import type { ReactNode } from 'react'
 import type { GetHeartRateResult } from '../types/tools'
+import type { MicState } from '../coach/micUplink'
+import type { TrackId } from '../coach/musicPlayer'
+import { MicPill, MusicPill } from './StatusPills'
 
 export type ConnState = 'idle' | 'connecting' | 'live' | 'error'
 
@@ -63,6 +66,10 @@ interface HudProps {
   readonly conn: ConnState
   readonly offline: boolean
   readonly inFrame: boolean
+  /** Uplink health. Three states, because they mean three different things to a user. */
+  readonly mic: MicState
+  /** The track currently playing, or null. Renders nothing when null. */
+  readonly musicTrack: TrackId | null
   readonly summary: string | null
   /** True while the reference clip occupies the panel. */
   readonly compact: boolean
@@ -79,6 +86,8 @@ export default function Hud({
   conn,
   offline,
   inFrame,
+  mic,
+  musicTrack,
   summary,
   compact,
   children,
@@ -136,6 +145,10 @@ export default function Hud({
           <span className="hud__dot" aria-hidden="true" />
           {CONN_LABEL[conn]}
         </span>
+        {/* Mic sits next to the connection state on purpose: both answer "can the
+            coach reach me", and together they are the whole two-way status. */}
+        <MicPill state={mic} />
+        <MusicPill track={musicTrack} />
         {offline ? <span className="hud__badge hud__badge--offline">OFFLINE</span> : null}
         {inFrame ? null : <span className="hud__badge hud__badge--frame">OUT OF FRAME</span>}
       </div>

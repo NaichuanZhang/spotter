@@ -95,6 +95,15 @@ function socketFactory() {
 
 const flush = () => new Promise((done) => setTimeout(done, 0))
 
+/**
+ * A retry path is more than one macrotask deep: the 429 retry awaits its (zero)
+ * delay, then mints a token, then defers ws.onopen by a microtask. One flush lands
+ * mid-chain, which reads as "the second socket never opened".
+ */
+const settle = async () => {
+  for (let i = 0; i < 4; i += 1) await flush()
+}
+
 describe('openHiggsSocket — an error frame before the ack decides the connect', () => {
   it('rejects with the server wording so the voice fallback can match on it', async () => {
     const { sockets, createSocket } = socketFactory()
@@ -136,10 +145,11 @@ describe('openHiggsSocket — an error frame before the ack decides the connect'
 })
 
 describe('createCoachSession — recovery from a rejected voice', () => {
-  it('retries once with fallbackVoice and reports live', async () => {
+  it('retries the SAME voice when voice validation is merely rate limited', async () => {
     const { sockets, createSocket } = socketFactory()
     const session = createCoachSession({
       persona: 'sarcastic',
+      voiceRetryDelayMs: 0,
       socket: { createSocket, fetchImpl: tokenFetch },
     })
     const connecting = session.connect()
@@ -147,25 +157,51 @@ describe('createCoachSession — recovery from a rejected voice', () => {
     expect(sockets[0].requestedVoice()).toBe(PERSONAS.sarcastic.voice)
 
     sockets[0].errorFrame(VOICE_429)
+    await settle()
+    sockets[1]?.emit({ type: 'session.created' })
+    await connecting
+
+    expect(sockets).toHaveLength(2)
+    // A 429 must NOT cost the persona its voice: that is how Super Sarcastic
+    // finished a demo sounding exactly like Super Mean.
+    expect(sockets[1].requestedVoice()).toBe(PERSONAS.sarcastic.voice)
+    expect(session.getStatus()).toBe('live')
+    session.disconnect()
+  })
+
+  it('falls back only when the voice genuinely does not exist', async () => {
+    const VOICE_UNKNOWN =
+      "Session terminated due to Error while handling session update: Invalid voice 'oliver': not found"
+    const { sockets, createSocket } = socketFactory()
+    const session = createCoachSession({
+      persona: 'sarcastic',
+      voiceRetryDelayMs: 0,
+      socket: { createSocket, fetchImpl: tokenFetch },
+    })
+    const connecting = session.connect()
     await flush()
+    sockets[0].errorFrame(VOICE_UNKNOWN)
+    await settle()
     sockets[1]?.emit({ type: 'session.created' })
     await connecting
 
     expect(sockets).toHaveLength(2)
     expect(sockets[1].requestedVoice()).toBe(PERSONAS.sarcastic.fallbackVoice)
     expect(session.getStatus()).toBe('live')
+    session.disconnect()
   })
 
   it('ignores a late close from the socket it already gave up on', async () => {
     const { sockets, createSocket } = socketFactory()
     const session = createCoachSession({
       persona: 'sarcastic',
+      voiceRetryDelayMs: 0,
       socket: { createSocket, fetchImpl: tokenFetch },
     })
     const connecting = session.connect()
     await flush()
     sockets[0].errorFrame(VOICE_429)
-    await flush()
+    await settle()
     sockets[1]?.emit({ type: 'session.created' })
     await connecting
 

@@ -13,6 +13,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { GetHeartRateResult, PersonaId } from '../types/tools'
 import type { WorkoutState } from '../types/events'
+import type { MicState } from '../coach/micUplink'
+import type { TrackId } from '../coach/musicPlayer'
 import Hud from './Hud'
 import type { ConnState } from './Hud'
 import PersonaRail from './PersonaRail'
@@ -57,6 +59,10 @@ interface WorkoutScreenProps {
   readonly heart: GetHeartRateResult
   readonly conn: ConnState
   readonly offline: boolean
+  /** Mic uplink health, straight from the coach session. */
+  readonly mic: MicState
+  /** Track currently playing, or null. */
+  readonly musicTrack: TrackId | null
   readonly summary: string | null
   readonly faultCandidate: FaultCandidate | null
   readonly utterance: Utterance | null
@@ -87,6 +93,8 @@ export default function WorkoutScreen({
   heart,
   conn,
   offline,
+  mic,
+  musicTrack,
   summary,
   faultCandidate,
   utterance,
@@ -166,6 +174,8 @@ export default function WorkoutScreen({
             conn={conn}
             offline={offline}
             inFrame={workout.inFrame}
+            mic={mic}
+            musicTrack={musicTrack}
             summary={summary}
             compact={clip !== null}
           >

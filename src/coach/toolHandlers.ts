@@ -1,25 +1,33 @@
 /**
- * The five tools, executing in the browser. Dependencies are injected rather than
+ * The six tools, executing in the browser. Dependencies are injected rather than
  * imported so a handler can be unit-tested with three lines of fakes and never
  * touches React state directly.
  *
- * Two invariants, both because the model blocks forever otherwise:
- *   1. No handler throws. Every one returns a ToolResult, `{ error }` included.
+ * Three invariants, the first two because the model blocks forever otherwise:
+ *   1. No handler throws. Every one returns a ToolResult, `{ error }` included — and
+ *      since play_music is async, no handler REJECTS either. `guard` covers both.
  *   2. Arguments arrive from a language model, so they are untrusted input and get
  *      validated at this boundary before anything downstream sees them.
+ *   3. A result says what HAPPENED, never what was requested. The coach speaks from
+ *      it, so an optimistic result is a coach telling the user something untrue.
  */
 
 import { FAULT_LABEL, FAULT_VIEW_RELIABILITY } from '../types/events'
 import type { CameraView, FaultType, WorkoutState } from '../types/events'
 import { isPersonaId } from './personas'
+import { isTrackId, MUSIC_CONFIG, TRACK_IDS } from './musicPlayer'
+import type { MusicController } from './musicControl'
 import type {
   GetHeartRateResult,
   GetWorkoutStateResult,
   LogSetArgs,
   LogSetResult,
+  MusicAction,
   PersonaId,
+  PlayMusicResult,
   SetPersonaResult,
   ShowReferenceResult,
+  ToolErrorResult,
   ToolHandler,
   ToolRegistry,
 } from '../types/tools'
@@ -104,6 +112,11 @@ export interface ToolHandlerDeps {
   showReference: (clip: ReferenceClip) => boolean | void
   /** Close the set and show the summary card. Return false if it could not log. */
   logSet: (args: Required<LogSetArgs>) => boolean | void
+  /**
+   * Music. The narrow controller view, not the player — this handler must never be
+   * able to touch the duck level, which belongs to the session.
+   */
+  music: MusicController
   /** Injected clock so the cooldown is testable. */
   now?: () => number
 }
@@ -191,28 +204,100 @@ export function createToolHandlers(deps: ToolHandlerDeps): ToolRegistry {
     return { logged, summary: summarise(reps, cleanReps, faults) } satisfies LogSetResult
   }
 
+  /**
+   * The one async handler. It has to be: starting audio can be REFUSED by the
+   * browser's autoplay policy (a tool call triggered by speech is not a click), and
+   * reporting "playing: true" before the browser has agreed would have the coach
+   * announce a track that never arrives.
+   */
+  const playMusic: ToolHandler = async (rawArgs) => {
+    const args = asRecord(rawArgs)
+    const action = readAction(args.action)
+    if (!action) {
+      return { error: `action must be "play" or "stop", not "${String(args.action)}"` }
+    }
+    if (action === 'stop') return stopMusic()
+
+    // Validated before the player sees it: an unknown id must come back as advice the
+    // model can act on, not as a thrown "unknown track" from inside musicPlayer.
+    if (args.track !== undefined && args.track !== null && !isTrackId(args.track)) {
+      return { error: `unknown track "${String(args.track)}"; the only tracks are ${TRACK_IDS.join(', ')}` }
+    }
+    const requested = isTrackId(args.track) ? args.track : undefined
+    try {
+      const playing = await deps.music.play(requested)
+      return {
+        action,
+        playing: true,
+        track: playing.track,
+        label: playing.label,
+        approxSec: playing.approxSec,
+        detail: `${playing.label} is playing now, about ${playing.approxSec} seconds of it.`,
+      } satisfies PlayMusicResult
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause)
+      // Truthful failure, phrased for the model to relay: it must not claim a track
+      // is on, and it must not silently retry.
+      return {
+        action,
+        playing: false,
+        track: null,
+        label: null,
+        approxSec: null,
+        detail: `The music did not start: ${detail}. Tell the user it would not play and keep coaching.`,
+      } satisfies PlayMusicResult
+    }
+  }
+
+  function stopMusic(): PlayMusicResult {
+    const wasPlaying = deps.music.isPlaying()
+    // Read BEFORE stopping: musicPlayer clears currentTrack() as it tears the graph
+    // down, so afterwards there is nothing left to name.
+    const track = deps.music.currentTrack()
+    deps.music.stop()
+    const label = track ? MUSIC_CONFIG.tracks[track].label : null
+    return {
+      action: 'stop',
+      playing: false,
+      track,
+      label,
+      approxSec: null,
+      detail: wasPlaying && label ? `${label} is stopped.` : 'There was no music playing.',
+    }
+  }
+
   return {
     show_reference: guard('show_reference', showReference),
     set_persona: guard('set_persona', setPersona),
     get_workout_state: guard('get_workout_state', getWorkoutState),
     get_heart_rate: guard('get_heart_rate', getHeartRate),
     log_set: guard('log_set', logSet),
+    play_music: guard('play_music', playMusic),
   }
 }
 
 /**
  * Last line of defence. A UI callback that throws must still produce a reply, or
  * the coach waits on a tool result that never comes and goes silent for good.
+ *
+ * Both failure shapes are caught, and that is not belt-and-braces: a sync handler
+ * THROWS and an async one REJECTS, and a rejection sails straight through a
+ * try/catch around a call that merely returns a promise.
  */
 function guard(name: string, handler: ToolHandler): ToolHandler {
   return (args) => {
     try {
-      return handler(args)
+      const outcome = handler(args)
+      return outcome instanceof Promise ? outcome.catch((cause) => failed(name, cause)) : outcome
     } catch (cause) {
-      const detail = cause instanceof Error ? cause.message : String(cause)
-      return { error: `${name} failed: ${detail}` }
+      return failed(name, cause)
     }
   }
+}
+
+function failed(name: string, cause: unknown): ToolErrorResult {
+  const detail = cause instanceof Error ? cause.message : String(cause)
+  return { error: `${name} failed: ${detail}` }
 }
 
 export function summarise(reps: number, cleanReps: number, faults: readonly FaultType[]): string {
@@ -250,6 +335,17 @@ function resolveView(fault: ReferenceFault, requested: unknown): CameraView {
   const reliable = FAULT_VIEW_RELIABILITY[fault].find((view) => spec.views.includes(view))
   if (reliable) return reliable
   return spec.views.length > 0 ? spec.views[0] : 'side'
+}
+
+/**
+ * Tolerant on case and whitespace only. "start"/"begin"/"kill" are deliberately NOT
+ * accepted: the enum is in the tool schema, and quietly guessing at a word outside it
+ * means the model never learns it sent the wrong one.
+ */
+function readAction(value: unknown): MusicAction | null {
+  if (typeof value !== 'string') return null
+  const normalised = value.trim().toLowerCase()
+  return normalised === 'play' || normalised === 'stop' ? normalised : null
 }
 
 function readCount(value: unknown): number | null {

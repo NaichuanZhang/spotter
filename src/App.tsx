@@ -12,7 +12,7 @@
  *   coach/toolHandlers— turns model tool calls into the UI callbacks below
  * Everything else in src/ui is presentational.
  */
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CoachEvent, WorkoutState } from './types/events'
 import type { GetHeartRateResult, PersonaId, ToolRegistry } from './types/tools'
 import { createPoseEngine } from './pose/poseEngine'
@@ -20,6 +20,11 @@ import type { PoseEngine } from './pose/poseEngine'
 import { createCoachSession } from './coach/session'
 import type { CoachSession, CoachSessionOptions, CoachStatus } from './coach/session'
 import { createToolHandlers, summarise } from './coach/toolHandlers'
+import { MIC_OFF } from './coach/micUplink'
+import type { MicState } from './coach/micUplink'
+import { createMusicPlayer } from './coach/musicPlayer'
+import type { MusicPlayer, TrackId } from './coach/musicPlayer'
+import type { MusicController, MusicDucker } from './coach/musicControl'
 import { createHeartRateState, repsPerMinute, step as stepHeartRate, toHeartRateResult } from './mock/heartRate'
 import type { HeartRateState } from './mock/heartRate'
 import IntroScreen from './ui/IntroScreen'
@@ -133,6 +138,10 @@ export default function App() {
     toHeartRateResult(createHeartRateState()),
   )
   const [conn, setConn] = useState<ConnState>('idle')
+  // Pushed from the session (damped there, so this is not a 10 Hz re-render) rather
+  // than polled: a denied mic has to show up the moment the prompt is dismissed.
+  const [micState, setMicState] = useState<MicState>(MIC_OFF)
+  const [musicTrack, setMusicTrack] = useState<TrackId | null>(null)
   const [offline, setOffline] = useState(false)
   const [captionsEnabled, setCaptionsEnabled] = useState(true)
   const [hintVisible, setHintVisible] = useState(false)
@@ -144,10 +153,63 @@ export default function App() {
 
   const engineRef = useRef<PoseEngine | null>(null)
   const sessionRef = useRef<CoachSession | null>(null)
+  const musicRef = useRef<MusicPlayer | null>(null)
   const personaRef = useRef<PersonaId>('mean')
   const heartRef = useRef<HeartRateState>(createHeartRateState())
   const repTimesRef = useRef<readonly number[]>([])
   const voiceRef = useRef(0)
+
+  /**
+   * Built on first use, not on mount. createMusicPlayer opens no AudioContext until
+   * play() runs, so this costs nothing until the coach actually calls play_music —
+   * and a context created outside a gesture would only come up suspended.
+   */
+  const getMusic = useCallback((): MusicPlayer => {
+    musicRef.current ??= createMusicPlayer({
+      onEnded: () => setMusicTrack(null),
+      onError: (error) => console.error('[spotter] music player failed:', describe(error)),
+    })
+    return musicRef.current
+  }, [])
+
+  /**
+   * The half play_music is allowed to touch. Deliberately does NOT expose setDucked:
+   * how loud the music sits under the coach is not a decision a language model gets
+   * to make. The React state written here is only what the HUD indicator reads.
+   */
+  const musicController = useMemo<MusicController>(
+    () => ({
+      play: async (track) => {
+        const playing = await getMusic().play(track)
+        setMusicTrack(playing.track)
+        return playing
+      },
+      stop: () => {
+        musicRef.current?.stop()
+        setMusicTrack(null)
+      },
+      isPlaying: () => musicRef.current?.isPlaying() ?? false,
+      currentTrack: () => musicRef.current?.currentTrack() ?? null,
+    }),
+    [getMusic],
+  )
+
+  /**
+   * The half the coach session is allowed to touch. Uses musicRef directly instead of
+   * getMusic(), so ducking silence never constructs a player: there is nothing to duck
+   * before the first track, and building an AudioContext outside a user gesture to
+   * lower a gain nobody can hear would be the worst of both worlds.
+   */
+  const musicDucker = useMemo<MusicDucker>(
+    () => ({
+      setDucked: (reason, ducked) => musicRef.current?.setDucked(reason, ducked),
+      stop: () => {
+        musicRef.current?.stop()
+        setMusicTrack(null)
+      },
+    }),
+    [],
+  )
 
   const applyPersona = useCallback((next: PersonaId) => {
     if (personaRef.current === next) return
@@ -201,8 +263,9 @@ export default function App() {
           setSummary(summarise(args.reps, args.cleanReps, args.faults))
           return true
         },
+        music: musicController,
       }),
-    [applyPersona],
+    [applyPersona, musicController],
   )
 
   /** Synchronous on purpose: unlockAudio must run inside the START click gesture. */
@@ -212,6 +275,9 @@ export default function App() {
       persona: personaRef.current,
       registry: buildRegistry(),
       getWorkoutState: () => engineRef.current?.getState() ?? null,
+      // Ducking only. The session cannot start a track through this.
+      music: musicDucker,
+      onMicState: setMicState,
       onStatus: (status) => setConn(STATUS_TO_CONN[status]),
       onCaption: (caption) => {
         setUtterance((previous) => nextUtterance(previous, caption.text, caption.final))
@@ -238,7 +304,7 @@ export default function App() {
       setConn('error')
       console.error('[spotter] coach session could not be created:', describe(error))
     }
-  }, [buildRegistry])
+  }, [buildRegistry, musicDucker])
 
   const reconnect = useCallback(() => {
     const session = sessionRef.current
@@ -247,6 +313,10 @@ export default function App() {
       return
     }
     setConn('connecting')
+    // A track outlives a socket. Reconnecting with hype-01 still running would leave
+    // 35 seconds of music playing over a session that no longer exists and cannot
+    // be asked to stop it.
+    safely('music stop', () => session.stopMusic())
     safely('coach disconnect', () => session.disconnect())
     void session.connect().catch((error: unknown) => {
       setConn('error')
@@ -367,10 +437,16 @@ export default function App() {
       safely('pose engine stop', () => engineRef.current?.stop())
       const session = sessionRef.current
       if (session) {
+        // destroy() also stops the mic capture and releases both duck reasons.
         void session.destroy().catch((error: unknown) => {
           console.error('[spotter] coach session teardown failed:', describe(error))
         })
       }
+      // Last, and unconditionally: the session only stops the TRACK, and only if it
+      // was ever given the ducker. The AudioContext and the <audio> element belong to
+      // this component and leak with the page otherwise.
+      safely('music destroy', () => musicRef.current?.destroy())
+      musicRef.current = null
     },
     [],
   )
@@ -388,6 +464,8 @@ export default function App() {
           heart={heartBeat}
           conn={conn}
           offline={offline}
+          mic={micState}
+          musicTrack={musicTrack}
           summary={summary}
           faultCandidate={faultCandidate}
           utterance={utterance}

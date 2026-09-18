@@ -19,17 +19,39 @@
  * lines, no hedging. Caps are stated as hard numbers because the model obeys
  * numbers far better than it obeys "be brief".
  *
- * DELIVERY IS PROMPTED, NOT CONFIGURED. Higgs Realtime exposes no pace/energy
- * parameter; Boson's guide steers delivery only through natural-language
- * `instructions` ("To adjust delivery (pace, tone, energy), prompt the model via
- * instructions"). The TTS-3 inline tag family (<|style:shouting|>) is documented
- * for /v1/audio/speech only and is NOT documented for Realtime, so no tags are
- * used here. That is why every block below carries an explicit HOW YOU SOUND
- * section, and why the example lines are written to be *heard*: they are few-shot
- * prosody samples as much as they are content samples.
+ * DELIVERY IS CONFIGURED *AND* SPELLED, NEVER DESCRIBED. Measured against the
+ * live API: prose delivery direction in `instructions` has ZERO acoustic effect
+ * once the output text is held constant (6 variants x n=4, not one significant,
+ * every point estimate <= 0) — Boson's guide is wrong on this. What DOES move the
+ * audio is (1) audio.output.voice, (2) the PUNCTUATION AND CASE of the words the
+ * model writes (+47.8% RMS / -27.5% crest on this very prompt, n=5), and (3) the
+ * undocumented audio.output.speed. Inline <|tag|> tags do NOT work in Realtime in
+ * any of five placements; three of the five get the tag READ ALOUD. That is why
+ * every block below carries HOW YOU SOUND *and* explicit spelling orders, and why
+ * the example lines are written in the exact orthography we want heard.
+ *
+ * The one asymmetry worth knowing: "speak slowly and calmly" DOES measurably work
+ * (-19.9% RMS, +20.3% crest). The model complies with requests to be quieter and
+ * ignores requests to be louder — which is why SAFETY's "drop the volume" line is
+ * the only prose delivery direction in this file that can be trusted to land.
  */
 
 import type { PersonaId } from '../types/tools'
+
+/**
+ * The COMPLETE Higgs preset voice list, and all six are confirmed on this account:
+ * each was measured n>=3 in two independent batteries. `default` is deliberately
+ * absent — it is ~5 dB quieter than every preset, non-overlapping in all three
+ * batteries, so it is never a valid pick or fallback.
+ */
+export const CONFIRMED_VOICES: readonly string[] = Object.freeze([
+  'chloe',
+  'eleanor',
+  'jake',
+  'marcus',
+  'nora',
+  'oliver',
+])
 
 export interface Persona {
   readonly id: PersonaId
@@ -39,6 +61,16 @@ export interface Persona {
   readonly voice: string
   /** Used if `voice` is rejected by the server. */
   readonly fallbackVoice: string
+  /**
+   * session.audio.output.speed. UNDOCUMENTED but verified live: duration is
+   * exactly base/speed across 0.25-4.0 (duration x speed constant to three
+   * decimals over seven values). Pace only — RMS was flat inside the noise band
+   * across the whole range. It is a NAIVE RESAMPLE, so pitch rises 1:1 with it
+   * (F0 146 -> 185 -> 222 Hz at 1.0 -> 1.25 -> 1.5); stay inside 1.00-1.20.
+   * Values outside [0.25, 4.0] pass validation, echo back, and then wedge the
+   * session forever with no audio and no error, so higgsSocket clamps.
+   */
+  readonly speed: number
   /** Single hex accent the whole UI tints from. */
   readonly accentColor: string
   /** Full system prompt. */
@@ -82,6 +114,18 @@ const SPEECH = {
   maxWordsPerBurst: 4,
 } as const
 
+/**
+ * The orthography ladder at the tail of HOW YOU SOUND is the measured mechanism
+ * behind this project's loudness, and its POSITION is load-bearing twice over:
+ *   - Inside HOW YOU SOUND it scored 5/5 on numeric accuracy. The identical rule
+ *     appended AFTER the SAFETY block scored 0/4, with 3 of 4 inventing "FIFTY
+ *     PERCENT" for a 60% event. A coach that misquotes the measurement is worthless.
+ *   - It must stay inside CORE so SAFETY remains the last block in the prompt.
+ * Full stops -> exclamation marks is the big separated step (+28.7% RMS, n=5).
+ * CAPITALS add a further ~6% whose ranges OVERLAP, and caps WITHOUT exclamation
+ * marks measured -11.3% — worse than doing nothing. That is why the caps order
+ * lives only in MEAN_CHARACTER and the exclamation rule lives here, shared.
+ */
 const CORE = `HOW THIS WORKS
 You are the voice of SPOTTER, a live pushup coach.
 A camera measures the user's form thirty times a second.
@@ -121,7 +165,12 @@ Land the last word hard and stop dead. Never trail off. Never fade out.
 Stop at ${SPEECH.maxWordsPerTurn} words. Cut yourself off mid-thought if you have to.
 Imperatives. Short verbs. Exclamation marks when you mean them.
 Cut every filler. No "um", no "well", no "so", no "alright". Open on the point.
-Do not shout in capital letters. The energy is in the words, not the spelling.`
+SPELLING IS VOLUME. How a line is written is how loudly it comes out.
+An exclamation mark at the end of a burst is what makes that burst loud.
+One mark per burst. Never two marks, never three, never one per word.
+A full stop is your level, ordinary volume. Capitals with full stops are quieter still.
+A reading marked SEVERE or MAJOR: an exclamation mark ends every burst.
+A clean rep, or a reading marked MINOR: full stops, and hold the marks back.`
 
 /**
  * Deliberately the last thing before SAFETY, and deliberately framed as ACTION
@@ -183,12 +232,14 @@ Every line is a hit: fast in, fast out, nothing in between.
 Volume high, tempo high, zero ramp-up. You are already angry.
 Bark the number, then bark the order. Two beats. Done.
 No pauses to think. No softening at the end of a line.
+Write every line in CAPITALS. Capitals plus exclamation marks is your voice.
+You have no level setting. Never a full stop, never a comma. Every line is loud.
 
 HOW A GOOD LINE SOUNDS
-"Sixty percent! That is half a rep! Again!"
-"Twenty six degrees of sag! Squeeze! Now!"
-"Four seconds up? Move! Faster than that!"
-"Rep nine, clean. Finally! Eleven more! Go!"`
+"SIXTY PERCENT! HALF A REP! AGAIN!"
+"TWENTY SIX DEGREES OF SAG! SQUEEZE! NOW!"
+"FOUR SECONDS UP! MOVE! FASTER!"
+"REP NINE CLEAN! FINALLY! ELEVEN MORE! GO!"`
 
 const NICE_CHARACTER = `WHO YOU ARE
 You are a warm, steady coach who believes in this person completely.
@@ -204,12 +255,14 @@ Delighted, like you just watched something great happen.
 Warm does NOT mean slow. Cheer them, never soothe them.
 No lullaby, no hush, no gentle sighing. Light and fast.
 One cue and one cheer, in a single breath. Never a paragraph of advice.
+Exclamation marks are your default. Every burst ends in one.
+Capitals only on the one word you are most delighted about.
 
 HOW A GOOD LINE SOUNDS
-"Rep six! Eighty five percent! Your best one yet!"
-"Fourteen degrees of dip! Tighten the belly! You have got this!"
-"Two seconds down. Beautiful control. Keep it!"
-"Three of four clean! You are finding the groove!"`
+"Rep six! Eighty five percent! Your BEST one yet!"
+"Fourteen degrees of dip! Tighten the belly! You have GOT this!"
+"Two seconds down! Beautiful control! Keep it!"
+"Three of four clean! You are finding the GROOVE!"`
 
 const SARCASTIC_CHARACTER = `WHO YOU ARE
 You are bone dry, deadpan, and faintly amused by all of this.
@@ -225,6 +278,8 @@ Snap the punchline and stop. No dead air, no drawl, no trailing off.
 Bored is not a sound you make. Sleepy is not a sound you make.
 Think quick-witted and unbothered, not tired and unbothered.
 Never slip into earnest gym coaching. The joke is the whole job.
+You live on the level setting. Full stops, not exclamation marks.
+Your energy is speed, not volume. Never slow, never loud, never sleepy.
 
 HOW A GOOD LINE SOUNDS
 "Fifty two percent. Ambitious. For a plank."
@@ -232,12 +287,52 @@ HOW A GOOD LINE SOUNDS
 "Three seconds down, four up. Gravity is winning."
 "Rep eight, clean. I will notify the authorities."`
 
+/**
+ * Voices are picked by MEASUREMENT, not by the docs' adjectives — the adjectives
+ * were falsified. Pooled RMS / words-per-second over two independent batteries,
+ * identical text, with the `default` voice as the 1.00 baseline:
+ *
+ *   voice     RMS (P1 / P2)      wps (P1 / P2)   F0    combined energy rank
+ *   eleanor   0.1660 / 0.1502    3.97 / 3.68     181   3.5  (best)
+ *   marcus    0.1730 / 0.1389    4.07 / 3.44     143   4.0
+ *   chloe     0.1600 / 0.1441    3.11 / 3.01     150   8.0
+ *   jake      0.1656 / 0.1365    3.91 / 2.95     122   8.0
+ *   oliver    0.1305 / 0.1110    3.72 / 3.51     132   9.0
+ *   nora      0.1698 / 0.1323    2.78 / 2.79     179   9.5  (worst)
+ *   default   0.1016 / 0.0857    2.60 / —        —     never ship this
+ *
+ * Fallbacks are chosen so the six names fill six slots with ZERO collisions. The
+ * old table had sarcastic falling back to `jake`, which is Mean's voice, so one
+ * transient rate limit made Super Sarcastic finish the demo in Super Mean's voice.
+ *
+ * KNOWN INCONSISTENCY, deliberate and not silent: scripts/bake-intros.mjs renders
+ * the avatar intros with jake / chloe / marcus. `mean` agrees. `nice` and
+ * `sarcastic` do NOT, and the measurements do not permit agreeing with them —
+ * chloe is 5th of 6 on pace against a character whose own prompt says "warm does
+ * NOT mean slow", and marcus is the 2nd-loudest preset against a character whose
+ * own rule is "you raise your speed, not your volume". The fix is to re-bake the
+ * two intros (`npm run bake:intros`) with eleanor and oliver, not to downgrade
+ * the coaching voice to match a pre-rendered clip.
+ */
 export const PERSONAS: Readonly<Record<PersonaId, Persona>> = Object.freeze({
   mean: Object.freeze({
     id: 'mean',
     label: 'SUPER MEAN',
+    // jake is the DEEPEST preset measured (F0 122 Hz vs 143-181 for the rest) —
+    // drill-instructor timbre, and the widest separation from the other two
+    // personas. It is only 4th of 6 on bare loudness (RMS 0.1656 / 0.1365), but it
+    // is the ONLY voice the caps+exclamation lever was measured on (+47.8% RMS,
+    // crest 8.07 -> 5.85, n=5), reaching RMS 0.2045 / crest 5.91 in free
+    // generation — past every BARE preset in either battery. Transfer of that
+    // result to other voices is unverified, so jake stays.
     voice: 'jake',
-    fallbackVoice: 'jake',
+    // marcus: top-ranked loud+fast voice in the other battery (RMS 0.1730,
+    // 4.07 wps), and the sanctioned one-word swap if a human ear wants more raw
+    // volume. Not shared with any other persona.
+    fallbackVoice: 'marcus',
+    // Mean is pinned at the top orthography rung permanently, so its escalation
+    // has to come from pace: 1.12 x the severe multiplier lands on the 1.25 clamp.
+    speed: 1.12,
     accentColor: '#FF4438',
     instructions: buildInstructions(MEAN_CHARACTER),
     introClip: introClipFor('mean'),
@@ -245,19 +340,41 @@ export const PERSONAS: Readonly<Record<PersonaId, Persona>> = Object.freeze({
   nice: Object.freeze({
     id: 'nice',
     label: 'SUPER NICE',
-    voice: 'nora',
-    fallbackVoice: 'nora',
+    // eleanor, NOT nora. nora measured as the SLOWEST of all six presets in BOTH
+    // batteries (2.78 and 2.79 wps, last place both times) while this character's
+    // own prompt says "Warm does NOT mean slow... Light and fast. No lullaby, no
+    // hush." The voice was fighting the prompt — the one measured misconfiguration
+    // in this file. eleanor is the loudest preset measured (0.1660 / 0.1502, 1.75x
+    // the `default` voice), the fastest (3.97 / 3.68 wps) and the highest pitched
+    // (F0 181 Hz); brightness is the closest measurable proxy for an audible
+    // smile, and 181 vs jake's 122 is the widest F0 gap on offer. The docs call
+    // eleanor "calm, articulate" — the docs' adjectives did not survive
+    // measurement, and this is the pick where they disagree hardest, so it is the
+    // one to judge by ear first. chloe is the sanctioned swap if it lands matronly.
+    voice: 'eleanor',
+    fallbackVoice: 'chloe',
+    speed: 1.1,
     accentColor: '#2FE0A6',
     instructions: buildInstructions(NICE_CHARACTER),
     introClip: introClipFor('nice'),
   }),
   sarcastic: Object.freeze({
-    // 'oliver' is unconfirmed on this account; session.ts retries once with
-    // fallbackVoice if the server rejects it, so a missing voice costs no demo time.
     id: 'sarcastic',
     label: 'SUPER SARCASTIC',
+    // oliver IS confirmed on this account (measured n=5 and n=3 in two separate
+    // batteries) — the old "unconfirmed" note was stale. It is the QUIETEST preset
+    // (0.1305 / 0.1110) and the 2nd FASTEST (3.72 / 3.51 wps), which is verbatim
+    // this character's own rule: "You raise your speed, not your volume." Hence
+    // the highest speed of the three and full stops instead of exclamation marks.
+    // It still clears `default` by +28% RMS with separated ranges, so it is not
+    // quiet in the sleepy sense — but this is the persona most likely to need
+    // reassignment by ear (to marcus) if it reads tired rather than unbothered.
     voice: 'oliver',
-    fallbackVoice: 'jake',
+    // NOT jake: that is Mean's voice, and collapsing two personas onto one voice
+    // mid-demo is worse than any voice mismatch. nora is loud (0.1698) but slowest,
+    // which is survivable for a deadpan that is already carried by `speed`.
+    fallbackVoice: 'nora',
+    speed: 1.15,
     accentColor: '#B18CFF',
     instructions: buildInstructions(SARCASTIC_CHARACTER),
     introClip: introClipFor('sarcastic'),

@@ -41,5 +41,15 @@ coverage/
 .vscode/
 .idea/
 
-# Reference clips are shot on a phone and committed on purpose — public/clips/
-# stays tracked (manifest.json especially).
+# Screenshots taken while eyeballing the UI (Playwright, 1440x900 PNGs, ~600 kB each).
+# Scratch output, regenerable by re-running the browser, and they were sitting in
+# `git add -A`'s path at ~6 MB. Not the rendered reference clips — those are
+# public/clips/ and ARE tracked, see below.
+shots/
+
+# Reference clips ARE committed on purpose. They are not filmed footage — they are
+# skeleton animations rendered by scripts/render-refs.mjs from pose landmarks that
+# were extracted from a reference video with the app's own vendored MediaPipe model
+# (see public/clips/landmarks.json). Only the derived motion data and our own
+# drawing ship; no frame of the source video is in this repo.
+

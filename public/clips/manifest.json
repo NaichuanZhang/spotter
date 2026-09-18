@@ -17,7 +17,7 @@
       },
       "front": {
         "file": "/clips/piked_hips-front.mp4",
-        "description": "Front view: the shoulders sit behind the hands and the back rounds up, then a corrected rep with the shoulders stacked over the wrists."
+        "description": "Front view: the hips ride up and the shoulders rock back over the hands, then a corrected rep where the back flattens and the hips drop level with the shoulders."
       }
     },
     "partial_depth": {
@@ -43,7 +43,7 @@
     "craned_neck": {
       "side": {
         "file": "/clips/craned_neck-side.mp4",
-        "description": "Side view: the chin pokes forward and the head leads the rep, then the same rep with a neutral neck and the gaze just ahead of the hands."
+        "description": "Side view: the head drops toward the floor and the neck folds shut, then the same rep with a neutral neck carried in line with the spine and the gaze just ahead of the hands."
       },
       "front": {
         "file": "/clips/craned_neck-front.mp4",
@@ -57,7 +57,7 @@
       },
       "front": {
         "file": "/clips/flared_elbows-front.mp4",
-        "description": "Front view: the elbows swing out to ninety degrees from the torso, then the same rep with the elbows tucked to about forty-five so they track back past the ribs."
+        "description": "Front view: the elbows swing out past ninety degrees from the torso, then the same rep with the elbows tucked to about forty-five so they track back past the ribs."
       }
     },
     "good_rep": {

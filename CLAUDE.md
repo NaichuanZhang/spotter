@@ -144,4 +144,67 @@ the failure mode, but it cannot guard `App.tsx`'s wiring — there is no jsdom i
 - **Biggest remaining risk is pose, not AI.** BlazePose assumes a vertical hip-centred body with the
   head visible; a pushup is horizontal. Budget the full H6:00–7:00 calibration block on the real
   camera at real height with three real bodies.
-- Reference clips still need shooting on a phone (~15 min, human task).
+- ~~Reference clips still need shooting on a phone (~15 min, human task).~~ **Done, and not by
+  phone.** All 14 exist in `public/clips/`, rendered by `node scripts/render-refs.mjs` as skeleton
+  animations from real pose landmarks (`public/clips/landmarks.json`, extracted from a reference
+  video with the app's own vendored model). 1.9 MB total, 640x360, h264/yuv420p, no audio. No frame
+  of the source video is in the repo.
+
+**2026-09-18 — vocal control (session payload, persona voices, per-severity dynamics)**
+
+Implemented the measured vocal plan in `src/coach/{personas,higgsSocket,session}.ts`. The two things
+worth remembering, both measured live, both contradicting what we went in believing:
+
+- 🔴 **A speed-only `session.update` does NOT skip the voices lookup.** The plan's tier-1a
+  per-severity pace patch rested on "a patch with no `voice` has no voice to validate". False: 20
+  consecutive speed-only patches returned `Could not validate voice 'jake': voices API returned HTTP
+  429` — **8/20 (40%) at a 300 ms gap, 1/20 (5%) at 2500 ms** — for frames containing no voice at all.
+  The server re-validates the session's *current* voice on every `session.update`. Post-ack it is
+  NOT fatal (session stayed open, audio kept flowing, the rejected patch is a plain no-op), so the
+  cost is a `CoachError` per failure plus a silently-unbumped bark. Shipped **disabled** behind
+  `PER_EVENT_PACE_ENABLED = false`. There is no such thing as a lookup-free partial patch.
+- 🟡 **`temperature` 0.8 → 0.3 is required** (every acoustic measurement was taken at 0.3; at 0.8 the
+  model overruns the 14-word cap). Side-effect seen in the live transcripts: the personas get more
+  literal. Sarcastic said "Severe fault. Fix it now." — flat, and quoting event vocabulary CORE
+  forbids. Nice said "Lock it down! Push through!" — drill-sergeant, not warm. Worth a human ear.
+- Voice picks now follow measurement, not the docs: mean `jake`, nice `eleanor` (was `nora`, the
+  slowest of all six presets while its own prompt says "warm does NOT mean slow"), sarcastic `oliver`.
+  Fallbacks are collision-free (`marcus`/`chloe`/`nora`) — sarcastic used to fall back to Mean's `jake`.
+- ⚠️ **`scripts/bake-intros.mjs` still renders intros with jake/chloe/marcus**, so nice and sarcastic
+  introduce themselves in a voice they do not coach in. Re-bake those two (`npm run bake:intros`) with
+  `eleanor` and `oliver`. Measurements do not permit moving the coaching voice to match the clips.
+- Numeric fidelity at the new prompt, 20 live turns across all three personas: **1 defect** — Mean
+  said "TWO SIX DEGREES" for `26deg` once in 10 turns. Zero in 5 nice and 5 sarcastic turns, so the
+  caps arm is implicated. Under the plan's 1-in-5 switch threshold, so the validated prompt stays;
+  the safer two-line variant is documented in `/tmp/vocal-plan.md` if it worsens.
+
+**2026-09-18 — reference clips + real-motion fixture: verification pass**
+
+Verified the 14 rendered clips and wired the extracted landmarks up as the repo's first
+non-synthetic test fixture. Three things worth remembering:
+
+- 🔴 **SPOTTER counts ZERO of the source demonstrator's six real pushups**, and this is now a test
+  (`src/pose/__tests__/realMotion.test.ts`, 7 cases) that replays all 578 extracted frames through
+  the real `measureAngles` → median-5 → `repMachine` chain. The detector and the geometry are fine
+  on a horizontal body — every frame is measurable, `skipped` is 0 — so the *biggest stated risk on
+  this project is retired*. What fails is calibration, in exactly one constant: `upEnterDeg = 155`.
+  The six cycles top out at **121.7 / 122.4 / 123.6 / 126.7 / 129.0 / 151.0** smoothed degrees. All
+  six break `downEnterDeg` (100), none come back up far enough to score, so the machine ends the
+  clip stuck in `bottom`. Scoring all six needs `upEnterDeg ≈ 120`, which collapses the hysteresis
+  gap from 55° to 20° — `repMachine.ts` says "the gap IS the algorithm", so that is a real trade to
+  make on real hardware, deliberately **not** made by the test. The test asserts the measured zero;
+  recalibrating will fail it on purpose.
+- 🟡 **`hipDeviation` does not gate on ankle visibility.** The source crops the feet — only 45 of 578
+  frames satisfy `requiredLandmarks`, ankle visibility is 0.14 median, ankle x reaches 1.27 — yet
+  `measureAngles` returns a hip deviation on all 578 by extrapolating the shoulder→ankle line to an
+  ankle the detector invented off-frame. Replaying the clip emits a **severe `piked_hips` at 68.3°**,
+  which no spine can do. Pinned as a characterisation test; if `hipDeviation` learns to refuse an
+  invisible ankle, rewrite that test to assert the refusal rather than loosen it.
+- 🔴 **`public/music/hype-01.mp3` is committed and is a commercial track** — ID3 title reads
+  `Farruko - Pepas (Official Video)`, 35 s, Traktor rip metadata, already in history (commit
+  `815cec6`) and wired into `musicPlayer.ts`. Same licence question the reference clips were
+  restructured to avoid. Needs replacing with a cleared/generated bed or dropping.
+
+Also: nothing reads `public/clips/manifest.json` at runtime — `REFERENCE_CLIPS` in
+`src/coach/toolHandlers.ts` is the table the coach actually speaks from, so the two sets of
+descriptions must be kept in step by hand (or collapsed to one source).
