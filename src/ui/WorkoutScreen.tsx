@@ -11,7 +11,7 @@
  * a duplicate getUserMedia call is not.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { PersonaId } from '../types/tools'
+import type { GetHeartRateResult, PersonaId } from '../types/tools'
 import type { WorkoutState } from '../types/events'
 import Hud from './Hud'
 import type { ConnState } from './Hud'
@@ -53,6 +53,8 @@ interface WorkoutScreenProps {
   readonly onPersona: (persona: PersonaId) => void
   readonly workout: WorkoutState
   readonly fps: number
+  /** Simulated heart rate, already lifted into App state — never read from a ref. */
+  readonly heart: GetHeartRateResult
   readonly conn: ConnState
   readonly offline: boolean
   readonly summary: string | null
@@ -70,6 +72,7 @@ export default function WorkoutScreen({
   onPersona,
   workout,
   fps,
+  heart,
   conn,
   offline,
   summary,
@@ -139,6 +142,7 @@ export default function WorkoutScreen({
             cleanReps={workout.cleanReps}
             elapsedSec={workout.setElapsedSec}
             fps={fps}
+            heart={heart}
             conn={conn}
             offline={offline}
             inFrame={workout.inFrame}

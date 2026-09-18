@@ -14,7 +14,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { CoachEvent, WorkoutState } from './types/events'
-import type { PersonaId, ToolRegistry } from './types/tools'
+import type { GetHeartRateResult, PersonaId, ToolRegistry } from './types/tools'
 import { createPoseEngine } from './pose/poseEngine'
 import type { PoseEngine } from './pose/poseEngine'
 import { createCoachSession } from './coach/session'
@@ -100,6 +100,15 @@ function nextUtterance(previous: Utterance | null, text: string, final: boolean)
   }
 }
 
+/**
+ * The heart rate simulation ticks at 5Hz but the displayed reading is rounded, so
+ * most ticks are visually identical. Returning the PREVIOUS object when nothing
+ * observable moved keeps the HUD from re-rendering for an unchanged number.
+ */
+function sameReading(a: GetHeartRateResult, b: GetHeartRateResult): boolean {
+  return a.bpm === b.bpm && a.zone === b.zone && a.trend === b.trend
+}
+
 function writeVoiceLevel(store: { current: number }, level: number): void {
   const clamped = Number.isFinite(level) ? Math.min(1, Math.max(0, level)) : 0
   if (Math.abs(clamped - store.current) < SESSION.VOICE_EPSILON) return
@@ -114,6 +123,15 @@ export default function App() {
   const [persona, setPersona] = useState<PersonaId>('mean')
   const [workout, setWorkout] = useState<WorkoutState>(IDLE_WORKOUT)
   const [fps, setFps] = useState(0)
+  // Two representations of ONE simulation, on purpose:
+  //   heartRef   — the live state the physics steps; read by the get_heart_rate
+  //                tool handler, which needs the freshest value, not a render-old one.
+  //   heartBeat  — the displayed reading. A ref mutation does not re-render, so the
+  //                number on screen MUST come from state. Both are written in the
+  //                same interval below; nothing reads heartRef during render.
+  const [heartBeat, setHeartBeat] = useState<GetHeartRateResult>(() =>
+    toHeartRateResult(createHeartRateState()),
+  )
   const [conn, setConn] = useState<ConnState>('idle')
   const [offline, setOffline] = useState(false)
   const [captionsEnabled, setCaptionsEnabled] = useState(true)
@@ -293,6 +311,10 @@ export default function App() {
   // repsPerMinute filters them all out, returns 0, and the simulated heart rate
   // never leaves its resting value no matter how hard the user works. Both clocks
   // are `number`, so neither tsc nor the bundler can catch the swap.
+  //
+  // This is also the ONLY place the displayed heart rate is published. Do not add a
+  // second timer for it, and do not let the HUD read heartRef: a ref mutation is
+  // invisible to React, so the widget would freeze at 64 bpm exactly as it used to.
   useEffect(() => {
     if (screen !== 'workout') return undefined
     let previousTick = performance.now()
@@ -300,7 +322,10 @@ export default function App() {
       const now = performance.now()
       const elapsed = now - previousTick
       previousTick = now
-      heartRef.current = stepHeartRate(heartRef.current, elapsed, repsPerMinute(repTimesRef.current, now))
+      const heart = stepHeartRate(heartRef.current, elapsed, repsPerMinute(repTimesRef.current, now))
+      heartRef.current = heart
+      const reading = toHeartRateResult(heart)
+      setHeartBeat((previous) => (sameReading(previous, reading) ? previous : reading))
 
       const engine = engineRef.current
       if (!engine) return
@@ -352,6 +377,7 @@ export default function App() {
           onPersona={applyPersona}
           workout={workout}
           fps={fps}
+          heart={heartBeat}
           conn={conn}
           offline={offline}
           summary={summary}

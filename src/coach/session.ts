@@ -115,6 +115,8 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
   let handlingToolCall = false
   let heartbeatTimer: Timer | null = null
   let reconnectTimer: Timer | null = null
+  /** Bumped per open attempt, so a socket we gave up on cannot close the one that replaced it. */
+  let generation = 0
 
   function debug(message: string, detail?: unknown): void {
     options.onDebug?.(message, detail)
@@ -163,6 +165,24 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
     onError: report,
     onClose: handleClose,
     onServerEvent: (type, payload) => debug(`unhandled server event: ${type}`, payload),
+  }
+
+  /**
+   * A failed attempt's socket closes AFTER we have already started the next one —
+   * the fallback-voice retry opens in ~1s, the dead socket's close can land later.
+   * Routing that late close into handleClose would null a live `conn`, stop its
+   * heartbeat and schedule a reconnect nobody asked for, leaving two live sessions
+   * racing for the one-session-per-key limit. So a close only counts if it came
+   * from the attempt we are still using.
+   */
+  function closeCallbackFor(attempt: number): HiggsCallbacks['onClose'] {
+    return (info) => {
+      if (attempt !== generation) {
+        debug(`ignored close ${info.code} from a superseded socket`)
+        return
+      }
+      handleClose(info)
+    }
   }
 
   function emitCaption(text: string, final: boolean): void {
@@ -292,10 +312,12 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
   async function openOnce(): Promise<void> {
     const persona = getPersona(personaId)
     const voice = voiceFor(persona)
+    generation += 1
+    const attempt = generation
     try {
       conn = await openHiggsSocket(
         { instructions: persona.instructions, voice },
-        callbacks,
+        { ...callbacks, onClose: closeCallbackFor(attempt) },
         options.socket,
       )
     } catch (cause) {

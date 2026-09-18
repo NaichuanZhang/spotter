@@ -9,6 +9,9 @@
         persona rail, intro cards. NEVER on a numeral.
       - One exception: the fault slab is always --fault (#FF3B30) whichever persona
         is live. A fault is a fault; character does not recolour the truth.
+      - Corollary: the heart-rate red (--metric-heart) is a METRIC hue, so it lives
+        inside the HUD, and it is held well clear of --fault so a rising pulse can
+        never be mistaken for a form fault.
    2. ONE GLASS LAYER, NEVER TWO STACKED. That is why the reference clip renders
       inside the HUD panel on a plain inset surface instead of floating as a card.
    3. HIERARCHY IS THE POINT. Rep numeral ~104px/800 against captions ~23px/600 —
@@ -31,6 +34,10 @@
   --metric-clean: #64d2ff;
   --metric-warn: #ffb020;
   --metric-ok: #32d74b;
+  /* Heart is the one metric convention insists on painting red. systemPink, NOT
+     --fault (#FF3B30): a simulated vital must never read as the fault slab. */
+  --metric-heart: #ff6482;
+  --metric-heart-rgb: 255 100 130;
 
   /* Glass recipe. Do not improvise a second one. */
   --glass-bg: rgba(10, 12, 16, 0.52);
@@ -301,6 +308,50 @@ body {
 .hud__value { font-size: clamp(18px, 2.2vw, 24px); font-weight: 700; color: var(--ink); }
 .hud__value--clean { color: var(--metric-clean); }
 .hud__value[data-low='true'] { color: var(--metric-warn); }
+/* Heart rate. Second in the hierarchy: ~42px against the 104px rep numeral (2.5x
+   smaller) and ~1.8x the other stat values — readable from fifteen feet, never the
+   thing the eye lands on first. The SIMULATED pill is not optional decoration; it
+   is the claim the number is allowed to make. */
+.hud__heart { display: grid; gap: 3px; }
+
+.hud__heartLabel { display: flex; align-items: center; font-size: 10px; letter-spacing: 0.18em; color: var(--ink-faint); }
+
+.hud__heartSim {
+  margin-left: 8px;
+  padding: 1px 6px;
+  border: 1px solid rgb(var(--metric-heart-rgb) / 0.34);
+  border-radius: 999px;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  color: rgb(var(--metric-heart-rgb) / 0.82);
+}
+
+.hud__heartValue { display: flex; align-items: baseline; gap: 8px; margin: 0; }
+
+.hud__heartBpm {
+  font-size: clamp(28px, 3.5vw, 42px);
+  font-weight: 800;
+  line-height: 0.9;
+  letter-spacing: -0.03em;
+  color: var(--metric-heart);
+}
+
+.hud__heartUnit { font-size: 11px; font-weight: 700; letter-spacing: 0.16em; color: var(--ink-faint); }
+
+/* animation-duration is overwritten inline, per beat, from the measured bpm. */
+.hud__heartGlyph {
+  display: inline-block;
+  font-size: clamp(16px, 1.9vw, 21px);
+  line-height: 1;
+  color: var(--metric-heart);
+  animation: spotter-heartbeat 1s ease-in-out infinite;
+}
+
+/* Big enough to register from the back of a room, small enough that it reads as a
+   modifier on the number rather than a second metric. */
+.hud__heartTrend { width: 1em; font-size: clamp(13px, 1.5vw, 17px); font-weight: 700; line-height: 1; text-align: center; color: var(--ink-dim); }
+.hud__heartTrend[data-trend='rising'] { color: var(--metric-heart); }
+
 .hud__strip { display: flex; align-items: center; gap: 10px; font-size: 10px; letter-spacing: 0.16em; color: var(--ink-dim); }
 .hud__conn { display: inline-flex; align-items: center; gap: 7px; }
 .hud__dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ink-faint); }
@@ -312,8 +363,11 @@ body {
 .hud__badge--frame { color: var(--fault); border-color: rgb(255 59 48 / 0.5); }
 .hud__summary { margin: 0; font-size: 12px; letter-spacing: 0.1em; color: var(--ink-dim); }
 
-/* The clip takes the panel's second row, so the status strip stands down. */
+/* The clip takes the panel's second row, so the status strip stands down and the
+   bpm gives back some height. It does NOT disappear — a vital that vanishes when a
+   reference clip appears is worse than no vital. */
 .hud[data-compact='true'] .hud__strip { display: none; }
+.hud[data-compact='true'] .hud__heartBpm { font-size: clamp(24px, 2.8vw, 32px); }
 
 /* -------------------------------------------------------- reference clip */
 
@@ -521,6 +575,16 @@ body {
 @keyframes spotter-slab-in {
   from { opacity: 0; transform: translateY(-8px); }
   to { opacity: 1; transform: none; }
+}
+
+/* Systole then a smaller diastole, one cycle per beat. The period is set inline
+   from the measured bpm, so the glyph pulses at whatever rate is on screen. */
+@keyframes spotter-heartbeat {
+  0%, 100% { transform: scale(1); opacity: 0.82; }
+  12% { transform: scale(1.16); opacity: 1; }
+  24% { transform: scale(1); opacity: 0.82; }
+  36% { transform: scale(1.08); opacity: 0.93; }
+  48% { transform: scale(1); opacity: 0.82; }
 }
 
 @keyframes spotter-chunk-in {

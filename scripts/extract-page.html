@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>SPOTTER landmark extraction</title>
+<!--
+  Offline landmark extraction page. Served ONLY by `node scripts/extract-landmarks.mjs
+  serve`; it is not part of the app and never ships in dist/.
+
+  It runs the repo's OWN vendored detector (/vendor/pose_landmarker_full.task plus the
+  /vendor/wasm fileset) over a source video and POSTs the resulting landmarks to
+  /ingest. No frame of the video is ever written anywhere — only coordinates leave
+  this page.
+
+  THREE THINGS THAT WILL BITE, all of them silent failures:
+
+  1. `detectForVideo(video, timestampMs)` — the timestamp is MANDATORY in all four
+     shipped overloads even though Google's own sample omits it. Omit it and you get
+     garbage landmarks, not an error. Timestamps must also be strictly increasing.
+  2. SEEK, DO NOT PLAY. `video.play()` in a headless browser drops frames whenever
+     detection is slower than realtime, and pose_landmarker_full on a CPU delegate
+     always is. Dropped frames silently lose reps. So: set currentTime, await
+     'seeked', await the frame actually being presented, then detect.
+  3. Wrong Content-Type on .wasm or .task makes FilesetResolver fail with a useless
+     message (or hang). The server sets application/wasm and application/octet-stream
+     on purpose — do not serve these from anything else.
+
+  Progress and results are exposed on `window.__spotterExtraction` for the driver:
+      window.__spotterExtraction.summary()   // small object, safe to print
+  The page also mirrors its state into the DOM as "STATUS: <state>" so a driver can
+  simply wait for the text.
+-->
+<style>
+  body { background: #101216; color: #e8eaed; font: 14px/1.5 ui-monospace, monospace; margin: 0; padding: 16px; }
+  #log { white-space: pre-wrap; margin-top: 12px; color: #9aa4b2; max-height: 40vh; overflow: auto; }
+  #status { font-size: 18px; font-weight: 700; }
+  .err { color: #ff6b6b; }
+  video { width: 180px; display: block; margin-top: 12px; border: 1px solid #2a2f3a; }
+</style>
+</head>
+<body>
+<div id="status">STATUS: booting</div>
+<div id="progress"></div>
+<video id="src" muted playsinline preload="auto"></video>
+<div id="log"></div>
+
+<script type="module">
+import { FilesetResolver, PoseLandmarker } from '/lib/vision_bundle.mjs'
+
+// ------------------------------------------------------------------ tunables
+
+const TUNING = {
+  /** A single seek that takes longer than this means the decoder is stuck. */
+  seekTimeoutMs: 15_000,
+  /** How long to wait for metadata before declaring the video undecodable. */
+  metadataTimeoutMs: 20_000,
+  /**
+   * Sample point inside each source frame, as a fraction of the frame duration.
+   * 0.5 lands mid-frame, which keeps a seek from landing ambiguously on the
+   * boundary between frame i and frame i+1.
+   */
+  frameSamplePhase: 0.5,
+  /** Progress lines are cheap but not free; log every N frames. */
+  logEveryFrames: 60,
+  /** Retry an upload once — a transient POST failure would throw away minutes of work. */
+  uploadRetries: 2,
+  uploadRetryDelayMs: 750,
+  /** Rounding of the raw dump. 6 decimals on a normalized coord is sub-pixel at 4K. */
+  decimals: { xy: 6, z: 6, visibility: 4 },
+}
+
+const EXPECTED_LANDMARKS = 33
+
+// --------------------------------------------------------------------- state
+
+const statusEl = document.getElementById('status')
+const progressEl = document.getElementById('progress')
+const logEl = document.getElementById('log')
+const video = document.getElementById('src')
+
+/**
+ * The single mutable cell in this page, deliberately: it is the progress channel the
+ * driver polls. Every write goes through `setState`, which returns a NEW object.
+ */
+let state = {
+  status: 'booting',
+  delegate: null,
+  requestedFrames: 0,
+  seekedFrames: 0,
+  detectedFrames: 0,
+  noPoseFrames: 0,
+  seekFailures: 0,
+  elapsedMs: null,
+  uploadedBytes: null,
+  error: null,
+}
+
+function setState(patch) {
+  state = { ...state, ...patch }
+  statusEl.textContent = `STATUS: ${state.status}`
+  statusEl.className = state.status === 'failed' ? 'err' : ''
+  progressEl.textContent =
+    `frames ${state.seekedFrames}/${state.requestedFrames}` +
+    `  detected ${state.detectedFrames}  no-pose ${state.noPoseFrames}` +
+    `  delegate ${state.delegate ?? '-'}` +
+    (state.error ? `\nERROR ${state.error}` : '')
+  return state
+}
+
+function log(message) {
+  logEl.textContent += `${message}\n`
+  logEl.scrollTop = logEl.scrollHeight
+  // Also to the console: the driver reads console messages when this page fails.
+  console.log(`[extract] ${message}`)
+}
+
+const round = (value, decimals) => {
+  if (!Number.isFinite(value)) return 0
+  const factor = 10 ** decimals
+  return Math.round(value * factor) / factor
+}
+
+const sleep = (ms) => new Promise((done) => setTimeout(done, ms))
+
+// ------------------------------------------------------------------ video I/O
+
+/** Resolve on `event`, reject on 'error' or timeout. Listeners always removed. */
+function waitForEvent(target, event, timeoutMs, label) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const cleanup = () => {
+      target.removeEventListener(event, onEvent)
+      target.removeEventListener('error', onError)
+      clearTimeout(timer)
+    }
+    const onEvent = () => { cleanup(); resolvePromise() }
+    const onError = () => {
+      cleanup()
+      const err = target.error
+      rejectPromise(new Error(
+        `${label}: media error code ${err?.code ?? '?'} ${err?.message ?? ''}`.trim(),
+      ))
+    }
+    const timer = setTimeout(() => {
+      cleanup()
+      rejectPromise(new Error(`${label}: timed out after ${timeoutMs}ms`))
+    }, timeoutMs)
+    target.addEventListener(event, onEvent, { once: true })
+    target.addEventListener('error', onError, { once: true })
+  })
+}
+
+/**
+ * Wait until the frame at the current position is actually PRESENTED. 'seeked' fires
+ * when the seek completed, which in practice precedes the new frame being available
+ * to the compositor; detecting on the previous frame would shift every measurement by
+ * one frame. requestVideoFrameCallback is the exact signal; two rAFs is the fallback.
+ */
+function waitForPresentedFrame() {
+  if (typeof video.requestVideoFrameCallback === 'function') {
+    return new Promise((done) => video.requestVideoFrameCallback(() => done()))
+  }
+  return new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(() => done())))
+}
+
+async function loadVideo(url) {
+  video.src = url
+  const wait = waitForEvent(video, 'loadedmetadata', TUNING.metadataTimeoutMs, 'loadedmetadata')
+  video.load()
+  await wait
+  if (!(video.videoWidth > 0) || !(video.videoHeight > 0)) {
+    throw new Error('video reported 0x0 — the browser decoded no video stream (codec unsupported?)')
+  }
+  log(`video ready: ${video.videoWidth}x${video.videoHeight}, duration ${video.duration.toFixed(3)}s`)
+}
+
+// ------------------------------------------------------------- the landmarker
+
+/**
+ * GPU first, CPU on any failure. Headless browsers routinely lack WebGL2, and this
+ * is an offline batch job: correctness beats speed, so a slow CPU pass is a fine
+ * outcome and a hard failure is not.
+ */
+async function createLandmarker(config) {
+  const fileset = await FilesetResolver.forVisionTasks(config.assets.wasmBase)
+  const baseOptions = {
+    modelAssetPath: config.assets.modelPath,
+  }
+  const options = {
+    runningMode: 'VIDEO',
+    numPoses: config.landmarker.numPoses,
+    minPoseDetectionConfidence: config.landmarker.minPoseDetectionConfidence,
+    minPosePresenceConfidence: config.landmarker.minPosePresenceConfidence,
+    minTrackingConfidence: config.landmarker.minTrackingConfidence,
+  }
+
+  for (const delegate of ['GPU', 'CPU']) {
+    try {
+      const landmarker = await PoseLandmarker.createFromOptions(fileset, {
+        ...options,
+        baseOptions: { ...baseOptions, delegate },
+      })
+      log(`landmarker created with ${delegate} delegate`)
+      return { landmarker, delegate }
+    } catch (err) {
+      log(`${delegate} delegate unavailable: ${err?.message ?? err}`)
+    }
+  }
+  throw new Error('PoseLandmarker.createFromOptions failed on both GPU and CPU delegates')
+}
+
+// ----------------------------------------------------------------- extraction
+
+function compactLandmarks(landmarks) {
+  const { xy, z, visibility } = TUNING.decimals
+  return landmarks.map((point) => [
+    round(point.x, xy),
+    round(point.y, xy),
+    round(point.z, z),
+    // visibility is optional in the type; a missing value must not read as "seen".
+    round(typeof point.visibility === 'number' ? point.visibility : 0, visibility),
+  ])
+}
+
+/**
+ * Seek to one frame and detect. Returns the frame record, or null when the detector
+ * found no pose (talking head, cutaway) — null is DATA, not an error.
+ */
+async function detectFrame(landmarker, index, source) {
+  const t = (index + TUNING.frameSamplePhase) * source.frameStep
+  video.currentTime = t
+  await waitForEvent(video, 'seeked', TUNING.seekTimeoutMs, `seek to ${t.toFixed(3)}s`)
+  await waitForPresentedFrame()
+
+  // Strictly increasing, derived from the sample time so it matches the media clock.
+  const timestampMs = Math.round(t * 1000)
+  const result = landmarker.detectForVideo(video, timestampMs)
+  const landmarks = result?.landmarks?.[0]
+  if (!Array.isArray(landmarks) || landmarks.length !== EXPECTED_LANDMARKS) return null
+  return { i: index, t: round(t, 6), tsMs: timestampMs, lm: compactLandmarks(landmarks) }
+}
+
+async function extractAll(landmarker, source) {
+  const frames = []
+  let seeked = 0
+  let noPose = 0
+  let seekFailures = 0
+
+  for (let index = 0; index < source.requestedFrames; index += 1) {
+    try {
+      const frame = await detectFrame(landmarker, index, source)
+      seeked += 1
+      if (frame) frames.push(frame)
+      else noPose += 1
+    } catch (err) {
+      // One unseekable frame must not abort a 22-second extraction.
+      seekFailures += 1
+      log(`frame ${index} skipped: ${err?.message ?? err}`)
+      if (seekFailures > source.requestedFrames / 4) {
+        throw new Error(`too many seek failures (${seekFailures}) — the decoder is not cooperating`)
+      }
+    }
+    if (index % TUNING.logEveryFrames === 0 || index === source.requestedFrames - 1) {
+      setState({ seekedFrames: seeked, detectedFrames: frames.length, noPoseFrames: noPose, seekFailures })
+      if (index % TUNING.logEveryFrames === 0) {
+        log(`frame ${index}/${source.requestedFrames}  poses ${frames.length}  no-pose ${noPose}`)
+      }
+    }
+  }
+
+  setState({ seekedFrames: seeked, detectedFrames: frames.length, noPoseFrames: noPose, seekFailures })
+  return { frames, seeked, noPose, seekFailures }
+}
+
+// --------------------------------------------------------------------- upload
+
+async function upload(url, payload) {
+  const body = JSON.stringify(payload)
+  for (let attempt = 1; attempt <= TUNING.uploadRetries; attempt += 1) {
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      })
+      if (!response.ok) throw new Error(`${response.status} ${await response.text()}`)
+      return { bytes: body.length, server: await response.json() }
+    } catch (err) {
+      log(`upload attempt ${attempt} failed: ${err?.message ?? err}`)
+      if (attempt === TUNING.uploadRetries) throw err
+      await sleep(TUNING.uploadRetryDelayMs)
+    }
+  }
+  throw new Error('unreachable')
+}
+
+// ----------------------------------------------------------------------- main
+
+async function main() {
+  const startedAt = new Date()
+  setState({ status: 'loading_config' })
+  const configResponse = await fetch('/config')
+  if (!configResponse.ok) throw new Error(`GET /config -> ${configResponse.status}`)
+  const config = await configResponse.json()
+  log(`config: ${config.source.width}x${config.source.height} @ ${config.source.fps}fps, ` +
+    `${config.source.requestedFrames} frames, step ${config.source.frameStep.toFixed(5)}s`)
+  setState({ requestedFrames: config.source.requestedFrames })
+
+  setState({ status: 'loading_video' })
+  await loadVideo(config.videoUrl)
+
+  setState({ status: 'loading_model' })
+  const { landmarker, delegate } = await createLandmarker(config)
+  setState({ status: 'extracting', delegate })
+
+  const t0 = performance.now()
+  const { frames, seeked, noPose, seekFailures } = await extractAll(landmarker, config.source)
+  const elapsedMs = Math.round(performance.now() - t0)
+  landmarker.close()
+  log(`extraction done in ${(elapsedMs / 1000).toFixed(1)}s: ${frames.length} poses from ${seeked} frames`)
+
+  setState({ status: 'uploading', elapsedMs })
+  const payload = {
+    meta: {
+      videoUrl: config.videoUrl,
+      source: config.source,
+      assets: config.assets,
+      landmarker: config.landmarker,
+      delegate,
+      runningMode: 'VIDEO',
+      library: '@mediapipe/tasks-vision (vendored wasm, vendored .task)',
+      userAgent: navigator.userAgent,
+      startedAt: startedAt.toISOString(),
+      finishedAt: new Date().toISOString(),
+      elapsedMs,
+      requestedFrames: config.source.requestedFrames,
+      seekedFrames: seeked,
+      detectedFrames: frames.length,
+      noPoseFrames: noPose,
+      seekFailures,
+    },
+    frames,
+  }
+  const uploaded = await upload(config.ingestUrl, payload)
+  setState({ status: 'uploaded', uploadedBytes: uploaded.bytes })
+  log(`uploaded ${(uploaded.bytes / 1e6).toFixed(2)} MB to ${config.ingestUrl}`)
+}
+
+window.__spotterExtraction = {
+  summary: () => ({ ...state }),
+  get status() { return state.status },
+}
+
+main().catch((err) => {
+  const message = err?.stack ?? String(err)
+  setState({ status: 'failed', error: message })
+  log(`FAILED ${message}`)
+  console.error('[extract] failed', err)
+})
+</script>
+</body>
+</html>

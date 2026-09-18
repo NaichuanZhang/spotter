@@ -10,8 +10,14 @@ dist/
 # Regenerate with: npm run vendor:mediapipe
 public/vendor/
 
-# Baked avatar intro videos. Regenerate with: npm run bake:intros
-public/avatars/*.mp4
+# Baked avatar intro videos ARE tracked, on purpose. They total ~2.8 MB, the
+# Dockerfile does not run bake:intros (it would need the API key at build time,
+# cost credits on every deploy, and add ~75 s), and without them the deployed
+# intro screen renders three empty video elements. Regenerate with:
+#   npm run bake:intros            # all three, but see below
+#   node scripts/bake-intros.mjs --only=mean
+# Render them ONE AT A TIME: concurrent /v1/videos calls return HTTP 429
+# rate_limit_exceeded on this account.
 
 # Instacloud CLI state.
 .insta/

@@ -260,6 +260,12 @@ export async function openHiggsSocket(
       }
       settled = true
       clearTimeout(timer)
+      // Nobody outside this promise has a reference to the socket yet, so an
+      // abandoned half-open session would just sit there counting against the
+      // concurrency limit (close 1013) while the caller retries. Close through
+      // the connection so the close is marked as ours and does not re-report as
+      // a second failure — onClose still fires, so reconnect policy is intact.
+      state.connection.close()
       reject(error)
     }
 
@@ -284,6 +290,8 @@ function createState(ws: WebSocket, cb: HiggsCallbacks): SocketState {
   let transcript = ''
   let responding = false
   let closedByUs = false
+  /** True once the server has acknowledged session.update. See the error case below. */
+  let acked = false
 
   const state: SocketState = {
     connection: {
@@ -383,6 +391,7 @@ function createState(ws: WebSocket, cb: HiggsCallbacks): SocketState {
     switch (type) {
       case 'session.created':
       case 'session.updated':
+        acked = true
         state.onReady()
         return
 
@@ -430,8 +439,16 @@ function createState(ws: WebSocket, cb: HiggsCallbacks): SocketState {
         return
 
       case 'error': {
-        const message = readErrorMessage(payload)
-        cb.onError(new CoachError('server_error', message, payload))
+        const error = new CoachError('server_error', readErrorMessage(payload), payload)
+        // Before the ack, an error frame IS the outcome of the connect: the server
+        // rejects session.update and terminates, so no session.created ever lands.
+        // Measured live: voice validation intermittently answers HTTP 429 and the
+        // server replies "Could not validate voice 'oliver'". Treating that as
+        // non-fatal cost the caller the full connectTimeoutMs of dead air and threw
+        // away the server's own wording, which is what shouldRetryWithFallbackVoice
+        // matches on — so the fallback voice was never tried.
+        if (!acked) state.onFatal(error)
+        else cb.onError(error)
         return
       }
 

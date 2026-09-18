@@ -48,14 +48,24 @@ const INTRO_SCRIPTS = {
 }
 
 /**
- * Prepended to each script. Only style:shouting and emotion:anger are verified
- * to be consumed silently — if an unverified tag ever gets READ ALOUD, blank
- * that persona's string (or run with --no-tags) and re-render.
+ * Prepended to each script. Tags are parsed and consumed, not read aloud
+ * (verified against the live API) — if an unverified tag ever gets READ ALOUD,
+ * blank that persona's string (or run with --no-tags) and re-render.
+ *
+ * Vocabulary confirmed from the preset-voice sample inputs at
+ * https://docs.boson.ai/models/higgs-tts/voices.md :
+ *   emotion:  enthusiasm | elation | amusement | contentment | awe |
+ *             contemplation | anger
+ *   prosody:  pause | speed_slow
+ *   sfx:      laughter
+ *   style:    shouting
+ * `enthusiasm` and `elation` are the high-energy ones and are what the docs'
+ * own energetic samples use — prefer them over `happy`, which is not attested.
  */
 const TAGS = {
   mean: '<|style:shouting|><|emotion:anger|>',
-  nice: '<|emotion:happy|>',
-  sarcastic: '<|emotion:amused|>',
+  nice: '<|emotion:enthusiasm|>',
+  sarcastic: '<|emotion:amusement|>',
 }
 
 /**
@@ -70,13 +80,30 @@ const REF_IMAGES = {
   sarcastic: 'https://i.pravatar.cc/512?img=33',
 }
 
-/** Higgs TTS voice per persona. See VOICE_FALLBACK for the unverified ones. */
+/**
+ * Higgs TTS voice per persona. THE COMPLETE preset list is exactly these six —
+ * confirmed from https://docs.boson.ai/models/higgs-tts/voices.md . Anything else
+ * fails, and note HOW it fails for the avatar route: the POST succeeds, then the
+ * render job later reports `status: "failed"` with `tts stream failed: 400 Unknown
+ * voice`. So a bad voice is NOT caught by the POST-time retry — it costs a full
+ * render cycle. (`GET /v1/audio/voices` lists only CLONED voices and returns an
+ * empty array here; it is not the preset list.)
+ *
+ *   chloe    friendly, clear, engaging          — medium-high energy
+ *   eleanor  calm, articulate, professional     — low energy
+ *   jake     energetic, slightly dramatic       — HIGHEST energy
+ *   marcus   enthusiastic, confident, professorial — high energy
+ *   nora     calm, clear, narrative             — low energy
+ *   oliver   calm, thoughtful, reflective, slow — LOWEST energy
+ *
+ * Energy is chosen deliberately here: the docs describe `nora` and `oliver` as
+ * *calm*, which reads as flat for a workout coach no matter how the prompt is
+ * written. Voice selection is half the energy problem; the prompt is the other half.
+ */
 const VOICES = {
   mean: 'jake',
-  nice: 'nora',
-  // Unverified id. If Boson rejects it the render retries with VOICE_FALLBACK
-  // rather than leaving the demo one video short.
-  sarcastic: 'chadwick',
+  nice: 'chloe',
+  sarcastic: 'marcus',
 }
 
 const VOICE_FALLBACK = 'jake'

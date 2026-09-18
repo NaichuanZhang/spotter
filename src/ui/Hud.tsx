@@ -7,8 +7,14 @@
  *
  * The reference clip renders as `children` INSIDE this panel; when it does, the
  * HUD collapses to a single row so there is still only one glass surface.
+ *
+ * Heart rate lives here and nowhere else, for two reasons. It is the one metric
+ * that is conventionally red, and metric hues are legal only inside this panel.
+ * And it is SIMULATED, so it carries that word on screen permanently — the panel
+ * is the only place honest enough to put it.
  */
 import type { ReactNode } from 'react'
+import type { GetHeartRateResult } from '../types/tools'
 
 export type ConnState = 'idle' | 'connecting' | 'live' | 'error'
 
@@ -20,7 +26,18 @@ const CONN_LABEL: Readonly<Record<ConnState, string>> = {
 }
 
 /** HUD thresholds. Recalibrate here, nowhere else. */
-const HUD = { HEALTHY_FPS: 18 } as const
+const HUD = {
+  HEALTHY_FPS: 18,
+  /** Floor for the heartbeat animation, so a nonsense bpm cannot divide by zero. */
+  MIN_ANIMATED_BPM: 30,
+} as const
+
+/** Fixed-width slot, so the row does not shift sideways as the trend changes. */
+const TREND_GLYPH: Readonly<Record<GetHeartRateResult['trend'], string>> = {
+  rising: '▲',
+  steady: '·',
+  falling: '▼',
+}
 
 function formatClock(totalSeconds: number): string {
   const safe = Number.isFinite(totalSeconds) && totalSeconds > 0 ? Math.floor(totalSeconds) : 0
@@ -29,12 +46,20 @@ function formatClock(totalSeconds: number): string {
   return `${minutes}:${String(seconds).padStart(2, '0')}`
 }
 
+/** One glyph pulse per beat: the animation period IS the measured bpm. */
+function beatPeriod(bpm: number): string {
+  const safe = Number.isFinite(bpm) && bpm > HUD.MIN_ANIMATED_BPM ? bpm : HUD.MIN_ANIMATED_BPM
+  return `${(60 / safe).toFixed(3)}s`
+}
+
 interface HudProps {
   readonly target: number
   readonly totalReps: number
   readonly cleanReps: number
   readonly elapsedSec: number
   readonly fps: number
+  /** The simulation's current reading, exactly as get_heart_rate reports it. */
+  readonly heart: GetHeartRateResult
   readonly conn: ConnState
   readonly offline: boolean
   readonly inFrame: boolean
@@ -50,6 +75,7 @@ export default function Hud({
   cleanReps,
   elapsedSec,
   fps,
+  heart,
   conn,
   offline,
   inFrame,
@@ -81,6 +107,29 @@ export default function Hud({
           </div>
         </dl>
       </div>
+
+      {/* `simulated` is `true` by type in GetHeartRateResult, so the word is not
+          conditional — there is no reading of this metric that is not simulated. */}
+      <dl className="hud__heart">
+        <dt className="hud__heartLabel">
+          HEART{' '}
+          <span className="hud__heartSim">SIMULATED</span>
+        </dt>
+        <dd className="hud__heartValue">
+          <span
+            className="hud__heartGlyph"
+            style={{ animationDuration: beatPeriod(heart.bpm) }}
+            aria-hidden="true"
+          >
+            ♥
+          </span>
+          <span className="hud__heartBpm">{heart.bpm}</span>
+          <span className="hud__heartUnit">BPM</span>
+          <span className="hud__heartTrend" data-trend={heart.trend} role="img" aria-label={heart.trend}>
+            {TREND_GLYPH[heart.trend]}
+          </span>
+        </dd>
+      </dl>
 
       <div className="hud__strip">
         <span className="hud__conn" data-conn={conn}>
