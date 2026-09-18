@@ -1,0 +1,74 @@
+{
+  "clips": {
+    "sagging_hips": {
+      "side": {
+        "file": "/clips/sagging_hips-side.mp4",
+        "description": "Side view: the hips sink below the shoulder-to-ankle line, then the same rep with the glutes and abs braced so the body holds one straight plank."
+      },
+      "front": {
+        "file": "/clips/sagging_hips-front.mp4",
+        "description": "Front view: the lower back dips and the shoulders creep forward, then a corrected rep where the whole torso stays level."
+      }
+    },
+    "piked_hips": {
+      "side": {
+        "file": "/clips/piked_hips-side.mp4",
+        "description": "Side view: the hips ride high into a tent shape, then the same rep with the hips lowered until shoulders, hips and ankles form one line."
+      },
+      "front": {
+        "file": "/clips/piked_hips-front.mp4",
+        "description": "Front view: the shoulders sit behind the hands and the back rounds up, then a corrected rep with the shoulders stacked over the wrists."
+      }
+    },
+    "partial_depth": {
+      "side": {
+        "file": "/clips/partial_depth-side.mp4",
+        "description": "Side view: a half rep that stops well short, then a full rep lowering until the chest is a fist off the floor and the elbows pass ninety degrees."
+      },
+      "front": {
+        "file": "/clips/partial_depth-front.mp4",
+        "description": "Front view: the chest barely moves on the first rep, then a full-depth rep where the chest clearly drops between the hands."
+      }
+    },
+    "no_lockout": {
+      "side": {
+        "file": "/clips/no_lockout-side.mp4",
+        "description": "Side view: the rep stops short at the top with the elbows still bent, then a rep pressed all the way to straight arms before the next descent."
+      },
+      "front": {
+        "file": "/clips/no_lockout-front.mp4",
+        "description": "Front view: the arms never straighten between reps, then a rep finished with a full lockout and the torso still braced."
+      }
+    },
+    "craned_neck": {
+      "side": {
+        "file": "/clips/craned_neck-side.mp4",
+        "description": "Side view: the chin pokes forward and the head leads the rep, then the same rep with a neutral neck and the gaze just ahead of the hands."
+      },
+      "front": {
+        "file": "/clips/craned_neck-front.mp4",
+        "description": "Front view: the head tilts and the shoulders ride up toward the ears, then a corrected rep with the neck long and the shoulders pulled down."
+      }
+    },
+    "flared_elbows": {
+      "side": {
+        "file": "/clips/flared_elbows-side.mp4",
+        "description": "Side view: the upper arms fan away from the ribs, then a rep where the elbows stay close and travel backwards rather than sideways."
+      },
+      "front": {
+        "file": "/clips/flared_elbows-front.mp4",
+        "description": "Front view: the elbows swing out to ninety degrees from the torso, then the same rep with the elbows tucked to about forty-five so they track back past the ribs."
+      }
+    },
+    "good_rep": {
+      "side": {
+        "file": "/clips/good_rep-side.mp4",
+        "description": "Side view exemplar: one clean rep at full depth and full lockout with a straight body line, about two seconds down and one second up."
+      },
+      "front": {
+        "file": "/clips/good_rep-front.mp4",
+        "description": "Front view exemplar: one clean rep with the elbows tucked, the hands under the shoulders, and the torso level the whole way through."
+      }
+    }
+  }
+}

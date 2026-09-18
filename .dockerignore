@@ -1,0 +1,27 @@
+# Keep the build context small and never ship secrets.
+node_modules
+.git
+.gitignore
+dist
+.env
+.env.*
+!.env.example
+
+# Deploy tooling state — not needed inside the image.
+.insta
+
+# Local noise.
+.DS_Store
+*.log
+npm-debug.log*
+coverage
+.vscode
+.idea
+
+# Dockerfile itself does not need to be in the context it builds.
+Dockerfile
+.dockerignore
+
+# NOTE: public/ is deliberately NOT ignored — public/vendor (MediaPipe model +
+# wasm) and public/avatars (baked intros) are copied in when present, and the
+# build stage re-runs scripts/fetch-mediapipe.mjs if they are missing.
