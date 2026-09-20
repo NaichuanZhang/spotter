@@ -2,12 +2,17 @@
 /**
  * SPOTTER backend. Deliberately tiny: zero dependencies, node: builtins only.
  *
- * Two jobs and nothing else:
+ * Three jobs and nothing else:
  *   1. POST /api/session  — mint a short-lived Boson ephemeral client secret.
  *                           The real BOSON_API_KEY never leaves this process.
- *   2. GET  /healthz      — liveness for Instacloud.
- * Plus static hosting of the built SPA in ./dist (the browser does all the work,
- * so there is no other route: no audio proxy, no pose endpoint, no database).
+ *   2. POST /api/verdict  — render the closing-screen avatar verdict from the
+ *                           user's STATS. Proxied for one reason: the ephemeral
+ *                           realtime token does NOT grant /v1/videos, so the
+ *                           only credential that can render is the one the
+ *                           browser must never see.
+ *   3. GET  /healthz      — liveness for Instacloud.
+ * Plus static hosting of the built SPA in ./dist (the browser does everything
+ * else: no audio proxy, no pose endpoint, no database).
  *
  * Instacloud gives us exactly ONE http port and no raw TCP, which is why the
  * realtime WebSocket goes browser -> Boson directly and never through here.
@@ -18,6 +23,17 @@ import { createReadStream } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { extname, join, normalize, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
+
+import { getAvatarPersona } from './avatarPersonas.mjs'
+import { buildVerdictText, validateVerdictStats, verdictCacheKey } from './verdictText.mjs'
+import {
+  VerdictBusyError,
+  readVerdictCache,
+  verdictCacheStats,
+  withVerdictSingleFlight,
+  writeVerdictCache,
+} from './verdictCache.mjs'
+import { VerdictRenderError, renderVerdictVideo } from './verdictRender.mjs'
 
 // ---------------------------------------------------------------- tunables
 // Everything environment- or API-shaped lives here so redeploy tweaks are a
@@ -50,6 +66,35 @@ const LIMITS = {
   requestBodyBytes: 4096,
   /** Upstream error text is forwarded (it says things like insufficient_quota). */
   upstreamErrorChars: 400,
+}
+
+/**
+ * POST /api/verdict. The mp4 is the response BODY, so everything the UI needs
+ * to be honest about what it is playing travels in headers — and a header value
+ * is latin1, hence headerSafe() below and the ASCII assertion in verdictText.
+ */
+const VERDICT = {
+  /** Nine scalar stats. 4 KB is already absurd for that. */
+  bodyBytes: 4096,
+  headerTextChars: 400,
+  headerNotesChars: 600,
+  /**
+   * Without this, a cross-origin fetch() can read NONE of the X-Verdict-*
+   * headers and the UI has an mp4 it cannot label. Production is same-origin
+   * and dev proxies /api, so this is belt-and-braces — but the failure it
+   * prevents looks like "the server is not sending the job id".
+   */
+  exposedHeaders: [
+    'X-Verdict-Cache',
+    'X-Verdict-Job-Id',
+    'X-Verdict-Voice',
+    'X-Verdict-Persona',
+    'X-Verdict-Text',
+    'X-Verdict-Notes',
+    'X-Verdict-Elapsed-Ms',
+    'X-Verdict-Render-Ms',
+    'X-Verdict-Polls',
+  ].join(', '),
 }
 
 const MIME_TYPES = {
@@ -135,6 +180,46 @@ async function drainBody(req, limitBytes) {
     // reach the client rather than showing up as a bare connection reset.
     if (total > limitBytes) throw new Error(`request body exceeded ${limitBytes} bytes`)
   }
+}
+
+/**
+ * Read a JSON body. Distinguishes too-large from unparseable so the client is
+ * told which of the two it did, rather than a generic 400.
+ */
+async function readJsonBody(req, limitBytes) {
+  const chunks = []
+  let total = 0
+  for await (const chunk of req) {
+    total += chunk.length
+    if (total > limitBytes) {
+      const err = new Error(`request body exceeded ${limitBytes} bytes`)
+      err.tooLarge = true
+      throw err
+    }
+    chunks.push(chunk)
+  }
+  const raw = Buffer.concat(chunks).toString('utf8')
+  try {
+    return JSON.parse(raw)
+  } catch (parseErr) {
+    const err = new Error(
+      raw.trim() === ''
+        ? 'empty body: POST the workout stats as JSON'
+        : `body is not valid JSON: ${parseErr.message}`,
+    )
+    err.badJson = true
+    throw err
+  }
+}
+
+/**
+ * Header values are latin1 and a stray byte is silent mojibake in the browser,
+ * so anything outside printable ASCII is replaced rather than sent. Truncation
+ * is marked, because a quietly clipped verdict line reads as a template bug.
+ */
+function headerSafe(value, maxChars) {
+  const ascii = String(value ?? '').replace(/[^\x20-\x7E]/g, '?')
+  return ascii.length <= maxChars ? ascii : `${ascii.slice(0, maxChars - 3)}...`
 }
 
 /**
@@ -251,6 +336,223 @@ async function handleSession(req, res) {
     value: result.secret.value,
     expires_at: result.secret.expires_at,
   })
+}
+
+// ---------------------------------------------------------------- POST /api/verdict
+
+/**
+ * The mp4, with its provenance in headers.
+ *
+ * `cache` is 'miss' (this request paid for the render), 'hit' (served from a
+ * previous one) or 'shared' (joined a render already in flight). The UI can say
+ * "rendered in 13 s" honestly, or say nothing, but it is never guessing.
+ */
+function sendVerdictVideo(res, meta) {
+  const headers = {
+    ...CORS_HEADERS,
+    'Access-Control-Expose-Headers': VERDICT.exposedHeaders,
+    'Content-Type': meta.contentType,
+    'Content-Length': String(meta.bytes.byteLength),
+    // Never cached by the browser: the bytes are personal to one set, and the
+    // server's own bounded cache is the only place a repeat should be served from.
+    'Cache-Control': 'no-store',
+    'X-Verdict-Cache': meta.cache,
+    'X-Verdict-Job-Id': headerSafe(meta.jobId ?? 'none', 120),
+    'X-Verdict-Voice': headerSafe(meta.voice, 40),
+    'X-Verdict-Persona': headerSafe(meta.persona, 40),
+    'X-Verdict-Text': headerSafe(meta.text, VERDICT.headerTextChars),
+    'X-Verdict-Elapsed-Ms': String(meta.elapsedMs),
+    'X-Verdict-Render-Ms': String(meta.renderMs),
+    'X-Verdict-Polls': String(meta.polls),
+  }
+  if (meta.notes.length > 0) {
+    headers['X-Verdict-Notes'] = headerSafe(meta.notes.join(' | '), VERDICT.headerNotesChars)
+  }
+  res.writeHead(200, headers)
+  res.end(meta.bytes)
+  return meta.bytes.byteLength
+}
+
+/**
+ * Every non-200 answer. ALWAYS carries `text` once the template succeeded: the
+ * ending screen is supposed to be complete without the video, so a client that
+ * gets a 504 still has the coach's actual closing words to show and speak.
+ */
+function sendVerdictError(res, status, payload) {
+  return sendJson(res, status, { ...payload, video: false })
+}
+
+/** Runs the render under the one-at-a-time rule and caches the bytes. */
+async function renderAndCache({ apiKey, stats, text, cacheKey }) {
+  const persona = getAvatarPersona(stats.persona)
+  const single = await withVerdictSingleFlight(cacheKey, async ({ onJobId }) => {
+    const startedAt = Date.now()
+    const outcome = await renderVerdictVideo({ apiKey, persona, text, onJobId })
+    return writeVerdictCache(cacheKey, {
+      bytes: outcome.bytes,
+      contentType: outcome.contentType,
+      text,
+      voice: outcome.voice,
+      jobId: outcome.jobId,
+      renderMs: Date.now() - startedAt,
+      polls: outcome.statuses.length,
+      attempts: outcome.attempts,
+    })
+  })
+  log(
+    `verdict render ${single.shared ? 'shared' : 'done'} persona=${stats.persona} ` +
+      `job=${single.result.jobId} voice=${single.result.voice} ${single.result.renderMs}ms ` +
+      `${single.result.bytes.byteLength}b polls=${single.result.polls} ` +
+      `cache=${JSON.stringify(verdictCacheStats())}`,
+  )
+  return single
+}
+
+function verdictErrorBody(err, { stats, text }) {
+  if (err instanceof VerdictBusyError) {
+    return {
+      status: 409,
+      body: {
+        error: 'render_busy',
+        message:
+          'Another verdict render is already in flight and this one was NOT queued — ' +
+          'the ending screen is complete without the video, so retry only if you want the clip.',
+        // Job id and age only. NOT err.info.key — that is another request's
+        // stat tuple, and one caller's rep count is not this caller's business.
+        inFlight: { jobId: err.info.jobId, elapsedMs: err.info.elapsedMs },
+        retryable: true,
+        text,
+        persona: stats.persona,
+      },
+    }
+  }
+  if (err instanceof VerdictRenderError) {
+    return {
+      status: err.httpStatus,
+      body: {
+        error: err.code,
+        message: err.message,
+        detail: err.detail,
+        jobId: err.jobId,
+        attempts: err.attempts,
+        elapsedMs: err.elapsedMs ?? null,
+        // A rate limit or a timeout may well succeed later; a failed render of
+        // the same text on both voices will not.
+        retryable: err.code === 'render_rate_limited' || err.code === 'render_timeout',
+        text,
+        persona: stats.persona,
+      },
+    }
+  }
+  return null
+}
+
+async function handleVerdict(req, res) {
+  const startedAt = Date.now()
+  const apiKey = readApiKey()
+  if (!apiKey) {
+    logError(`no API key in env (looked for ${BOSON.keyEnvNames.join(', ')})`)
+    return sendVerdictError(res, 500, {
+      error: 'missing_api_key',
+      message:
+        `Server is missing a Boson API key. Set ${BOSON.keyEnvNames[0]} in the environment ` +
+        '(see .env.example) and restart. No render is possible without it.',
+    })
+  }
+
+  let body
+  try {
+    body = await readJsonBody(req, VERDICT.bodyBytes)
+  } catch (err) {
+    return sendVerdictError(res, err.tooLarge ? 413 : 400, {
+      error: err.tooLarge ? 'body_too_large' : 'invalid_json',
+      message: String(err.message ?? err),
+    })
+  }
+
+  const validation = validateVerdictStats(body)
+  if (!validation.ok) {
+    return sendVerdictError(res, 400, {
+      error: 'invalid_stats',
+      field: validation.field,
+      message: validation.message,
+    })
+  }
+  // `.key` — readApiKey returns { key, source }, and passing the wrapper here
+  // sends `Bearer [object Object]`, which the upstream answers with a 401 that
+  // reads exactly like a revoked key.
+  return renderValidated(res, { apiKey: apiKey.key, validation, startedAt })
+}
+
+/**
+ * Words only: no render, no credits, ~50 ms measured. This is what lets the UI
+ * show and SPEAK the coach's real closing line long before any video exists —
+ * the ending screen is supposed to be complete without the clip, and this is
+ * the route that makes that cheap instead of a duplicated template in the SPA.
+ */
+function sendVerdictPreview(res, { stats, notes, text, cacheKey }) {
+  return sendJson(res, 200, {
+    text,
+    persona: stats.persona,
+    voice: getAvatarPersona(stats.persona).voice,
+    notes,
+    cacheKey,
+    cached: readVerdictCache(cacheKey) !== null,
+    preview: true,
+    video: false,
+  })
+}
+
+/** Second half of handleVerdict: everything downstream of a valid stat tuple. */
+async function renderValidated(res, { apiKey, validation, startedAt }) {
+  const { stats, notes, preview } = validation
+  const cacheKey = verdictCacheKey(stats)
+
+  let text
+  try {
+    text = buildVerdictText(stats)
+  } catch (err) {
+    // A template that overflows or emits non-ASCII is OUR bug, not the client's.
+    logError(`verdict template failed for ${cacheKey}: ${err?.message ?? err}`)
+    return sendVerdictError(res, 500, {
+      error: 'verdict_template_failed',
+      message: 'The server could not build the closing line for those stats.',
+      detail: String(err?.message ?? err),
+    })
+  }
+
+  if (preview) return sendVerdictPreview(res, { stats, notes, text, cacheKey })
+
+  const cached = readVerdictCache(cacheKey)
+  if (cached) {
+    return sendVerdictVideo(res, {
+      ...cached,
+      cache: 'hit',
+      persona: stats.persona,
+      notes,
+      elapsedMs: Date.now() - startedAt,
+    })
+  }
+
+  try {
+    const single = await renderAndCache({ apiKey, stats, text, cacheKey })
+    return sendVerdictVideo(res, {
+      ...single.result,
+      cache: single.shared ? 'shared' : 'miss',
+      persona: stats.persona,
+      notes,
+      elapsedMs: Date.now() - startedAt,
+    })
+  } catch (err) {
+    const mapped = verdictErrorBody(err, { stats, text })
+    if (!mapped) throw err
+    // A 409 is the documented refusal, not a fault — logging it as ERROR would
+    // teach whoever reads these logs to ignore the line that means something.
+    const note = `verdict ${mapped.body.error} persona=${stats.persona} ${err.message}`
+    if (mapped.status === 409) log(note)
+    else logError(`${note} detail=${mapped.body.detail ?? '-'}`)
+    return sendVerdictError(res, mapped.status, { ...mapped.body, elapsedMs: Date.now() - startedAt })
+  }
 }
 
 // ---------------------------------------------------------------- static files
@@ -374,6 +676,16 @@ function route(req, res, urlPath, onDone) {
       return onDone(405, sendJson(res, 405, { error: 'method_not_allowed', message: 'POST /api/session' }))
     }
     return handleSession(req, res).then((bytes) => onDone(res.statusCode, bytes ?? 0))
+  }
+
+  if (urlPath === '/api/verdict') {
+    if (req.method !== 'POST') {
+      return onDone(405, sendJson(res, 405, {
+        error: 'method_not_allowed',
+        message: 'POST /api/verdict with the workout stats as JSON',
+      }))
+    }
+    return handleVerdict(req, res).then((bytes) => onDone(res.statusCode, bytes ?? 0))
   }
 
   if (urlPath.startsWith('/api/')) {

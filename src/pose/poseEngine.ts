@@ -32,6 +32,7 @@ import type { PoseAngles } from './angles'
 import { measureAngles } from './angles'
 import type { FaultCandidate, GateState } from './faults'
 import {
+  canSpeak,
   createGateState,
   evaluateFaults,
   evaluateRepFaults,
@@ -40,7 +41,9 @@ import {
   UTTERANCE_RANK,
 } from './faults'
 import type { Landmark } from './landmarks'
-import { inFrame } from './landmarks'
+import { bodyLineInFrame, countingInFrame } from './landmarks'
+import type { ObservabilityState } from './observability'
+import { createObservabilityState, OBSERVABILITY, stepObservability } from './observability'
 import type { RepMachineState } from './repMachine'
 import { createRepMachineState, step, syntheticRep } from './repMachine'
 import type { AngleWindows } from './smoothing'
@@ -74,7 +77,14 @@ export const ENGINE_CONFIG = {
   },
   defaultTarget: 20,
   defaultView: 'side' as CameraView,
-  /** Consecutive unmeasurable frames before announcing the user is gone. */
+  /**
+   * Consecutive frames without the COUNTING joints before announcing the user is gone.
+   *
+   * Counting joints, not all of them: losing the feet is not leaving the frame. That
+   * situation has its own signal — see `OBSERVABILITY` and `form_unobservable` — because
+   * "back up, I cannot see your hips" and "come back, I cannot see you" are different
+   * sentences and only one of them is true when a phone on the floor crops the ankles.
+   */
   outOfFrameFrames: 10,
   /** Consecutive good frames before announcing they are back. Higher = less flapping. */
   backInFrameFrames: 5,
@@ -217,6 +227,7 @@ export function createPoseEngine(options: PoseEngineOptions): PoseEngine {
   let reps: RepMachineState = createRepMachineState()
   let windows: AngleWindows = createAngleWindows()
   let gateState: GateState = createGateState()
+  let observability: ObservabilityState = createObservabilityState()
   let activeFaults: FaultType[] = []
   const faultsSeen = new Set<FaultType>()
 
@@ -254,15 +265,21 @@ export function createPoseEngine(options: PoseEngineOptions): PoseEngine {
   /**
    * Returns the events AND the instantaneous verdict. The debounce counters decide
    * when to *announce* framing (a one-frame blip is not worth a sentence), but fault
-   * evaluation must use `ok` from this frame: while the legs are leaving the frame,
-   * MediaPipe still reports hallucinated hip and ankle positions at low confidence,
-   * and the fault gate could fire a sag off that garbage before the debounce trips.
+   * evaluation must use `ok` from this frame: while the arm is leaving the frame,
+   * MediaPipe still reports hallucinated joint positions at low confidence, and the fault
+   * gate could fire off that garbage before the debounce trips.
+   *
+   * GATED ON THE COUNTING JOINTS ONLY. It used to be gated on `inFrame`, the full set, so a
+   * cropped pair of feet announced "user out of frame", set `WorkoutState.inFrame` false and
+   * suppressed EVERY fault — including `no_lockout` and `craned_neck`, which need no ankle
+   * at all. The joints the body line needs are handled by `handleObservability` instead, and
+   * the faults that depend on them suppress themselves through a null `hipDeviation`.
    */
   function handleFraming(
     landmarks: readonly Landmark[] | null,
     t: number,
   ): { events: CoachEvent[]; ok: boolean } {
-    const check = inFrame(landmarks)
+    const check = countingInFrame(landmarks)
     if (check.inFrame) {
       badFrames = 0
       goodFrames += 1
@@ -280,6 +297,35 @@ export function createPoseEngine(options: PoseEngineOptions): PoseEngine {
       return { events: [{ kind: 'out_of_frame', at: t, missing: check.missing }], ok: false }
     }
     return { events: [], ok: false }
+  }
+
+  /**
+   * "I can count, but I cannot see your hips." Routed through the fault gate's global
+   * utterance bucket rather than a bucket of its own, so it cannot talk over a form fault,
+   * and debounced by `OBSERVABILITY` so it is said once rather than thirty times a second.
+   *
+   * `missing` comes from the either-side in-frame check while measurability comes from the
+   * measured side, so a frame can be unmeasurable with nothing named (the ankle is visible
+   * on the other side only). That falls back to the body-line joint names, which is what the
+   * user has to reframe either way.
+   */
+  function handleObservability(
+    landmarks: readonly Landmark[] | null,
+    angles: PoseAngles,
+    t: number,
+  ): CoachEvent[] {
+    const measurable = angles.hipDeviation !== null
+    const check = bodyLineInFrame(landmarks)
+    const missing = check.missing.length > 0 ? check.missing : bodyLineInFrame(null).missing
+    const result = stepObservability(observability, {
+      measurable,
+      missing,
+      t,
+      canSpeak: canSpeak(gateState, t, OBSERVABILITY.rank),
+    })
+    observability = result.state
+    if (result.events.length > 0) gateState = noteUtterance(gateState, t, OBSERVABILITY.rank)
+    return result.events
   }
 
   function handleIdle(angles: PoseAngles, t: number): CoachEvent[] {
@@ -327,7 +373,15 @@ export function createPoseEngine(options: PoseEngineOptions): PoseEngine {
     // Per-rep faults first: right after a rep is when "that one was short" lands.
     const repEvents = completed ? runGate(evaluateRepFaults(completed, view), t, 'immediate') : []
     const frameEvents = runGate(
-      evaluateFaults({ angles, phase: reps.phase, view, inFrame: measurable }),
+      // `topMaxElbow` is the best elbow of the current top phase, which is what `no_lockout`
+      // must be scored on rather than this frame's angle. See `FaultContext.topElbow`.
+      evaluateFaults({
+        angles,
+        phase: reps.phase,
+        view,
+        inFrame: measurable,
+        topElbow: reps.topMaxElbow,
+      }),
       t,
       'frame',
     )
@@ -337,15 +391,16 @@ export function createPoseEngine(options: PoseEngineOptions): PoseEngine {
   // ----------------------------------------------------------------- the loop
 
   /**
-   * Note that reps keep counting when only the LEGS leave the frame: the arm chain is
-   * still measurable, and freezing the counter because someone's feet drifted out
-   * would read as broken. Faults are suppressed instead, which is the half that would
-   * otherwise be wrong.
+   * Reps keep counting when only the LEGS leave the frame: the arm chain is still
+   * measurable, and freezing the counter because someone's feet drifted out would read as
+   * broken. What stops instead is exactly the judgement those joints carried — `measureAngles`
+   * returns a null `hipDeviation`, `hipCandidates` therefore proposes nothing, and
+   * `handleObservability` tells the user why.
    */
   function processFrame(landmarks: readonly Landmark[] | null, t: number): CoachEvent[] {
     const framing = handleFraming(landmarks, t)
     const raw = measureAngles(landmarks)
-    // An unmeasurable frame is dropped entirely rather than coerced to zeros:
+    // An uncountable frame is dropped entirely rather than coerced to zeros:
     // zero angles read as a maximally deep rep and would fabricate reps.
     if (!raw) return framing.events
 
@@ -359,6 +414,9 @@ export function createPoseEngine(options: PoseEngineOptions): PoseEngine {
       ...framing.events,
       ...repEvents,
       ...handleFaults(angles, t, completed, framing.ok),
+      // After the faults: a real fault outranks "I cannot see your hips" for the frame's one
+      // utterance slot, and the gate's bucket is what enforces that ordering.
+      ...handleObservability(landmarks, angles, t),
       ...handleIdle(angles, t),
     ]
   }
@@ -390,6 +448,7 @@ export function createPoseEngine(options: PoseEngineOptions): PoseEngine {
     reps = createRepMachineState()
     windows = createAngleWindows()
     gateState = createGateState()
+    observability = createObservabilityState()
     activeFaults = []
     faultsSeen.clear()
     framed = true
@@ -463,6 +522,10 @@ export function createPoseEngine(options: PoseEngineOptions): PoseEngine {
         setStartedAt,
         setElapsedSec: setStartedAt === undefined ? 0 : (performance.now() - setStartedAt) / 1000,
         inFrame: framed,
+        // The announced state, not this frame's: a UI reading a per-frame flag would strobe
+        // on an ankle flickering across the visibility gate. `stepObservability` already
+        // debounces, so `announced` is the stable answer.
+        bodyLineObservable: !observability.announced,
       }
     },
     getLandmarks: () => latestLandmarks,

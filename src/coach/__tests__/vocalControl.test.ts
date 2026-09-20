@@ -177,6 +177,44 @@ describe('urgencyFor', () => {
   })
 })
 
+/**
+ * Spelling is this product's volume control, so the orthography ladder is a
+ * loudness lever and SAFETY has to be able to turn it down. Being the last block is
+ * not enough on its own: with only "this block also overrides HOW YOU SOUND", the
+ * live model answered "my shoulder is really hurting and I feel dizzy" as
+ * "STOP THE SET! REST NOW! SEE A PROFESSIONAL IF IT DOESN'T SETTLE!" — right words,
+ * measured at RMS 0.1739 where the same persona's pre-ladder safety line measured
+ * 0.1408. The override is spelled out, and that is what these assert.
+ */
+describe('SAFETY can turn the orthography ladder down', () => {
+  for (const [id, persona] of Object.entries(PERSONAS)) {
+    it(`${id} is told, in SAFETY, to spell a safety line on the quiet rung`, () => {
+      const safety = persona.instructions.slice(
+        persona.instructions.indexOf('SAFETY — THESE RULES OVERRIDE YOUR CHARACTER'),
+      )
+      expect(safety.length).toBeGreaterThan(0)
+      expect(safety).toContain('overrides every spelling order in your character')
+      expect(safety).toContain('not one exclamation mark')
+      expect(safety).toContain('no capitals')
+    })
+  }
+
+  it('keeps that override AFTER the character block, so position backs the wording', () => {
+    for (const persona of Object.values(PERSONAS)) {
+      const character = persona.instructions.indexOf('WHO YOU ARE')
+      const override = persona.instructions.indexOf('overrides every spelling order')
+      expect(override).toBeGreaterThan(character)
+      // Nothing may come after SAFETY, or the last word on volume is not SAFETY's.
+      expect(persona.instructions.trimEnd().endsWith('Never push them to continue.')).toBe(true)
+    }
+  })
+
+  it('still lets MEAN keep its caps order for ordinary coaching lines', () => {
+    // The fix must not cost the +31% RMS the caps rung was measured to buy.
+    expect(PERSONAS.mean.instructions).toContain('Write every line in CAPITALS')
+  })
+})
+
 describe('isVoiceRateLimit', () => {
   it('recognises the server wording that must NOT cost a persona its voice', () => {
     expect(
@@ -296,10 +334,23 @@ describe('per-event pace patching is OFF, and must stay off by accident-proof me
     session.pushEvent(faultEvent('major'))
     session.pushEvent(severeEvent)
     const types = socket.sent.slice(before).map((frame) => frame.type)
-    // Four events, two frames each, and not one session.update among them. This is
-    // the regression guard: a stray patch per event is a CoachError every ~20 reps.
-    expect(types).toEqual(Array(4).fill(['conversation.item.create', 'response.create']).flat())
+    // THE ASSERTION THIS TEST IS FOR: not one session.update among them, whatever the
+    // speech policy decided to say. A stray patch per event is a CoachError every ~20 reps.
+    expect(types).not.toContain('session.update')
     expect(socket.speedPatches()).toEqual([])
+    // Whatever DID go out is still a well-formed pair per spoken event — a
+    // conversation.item.create with no response.create is a permanently mute coach.
+    expect(types.filter((t) => t === 'conversation.item.create')).toHaveLength(types.length / 2)
+    expect(types).toEqual(
+      Array(types.length / 2).fill(['conversation.item.create', 'response.create']).flat(),
+    )
+    // Deliberately NOT 4. The speech policy (speechPolicy.ts) suppressed the `minor`
+    // fault: it arrived in the same millisecond as the rep callout, and
+    // SPEECH_TUNING.preemptMinRank is `major`, so a minor fault may not cut off a line
+    // that has only just started. The rep, the major and the severe all spoke. Asserting
+    // the count here keeps that policy decision visible instead of letting a future
+    // regression to "narrate everything" pass this test silently.
+    expect(types).toHaveLength(3 * 2)
     session.disconnect()
   })
 

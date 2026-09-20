@@ -167,37 +167,88 @@ export interface LandmarkRequirement {
 }
 
 /**
- * The joints without which no pushup measurement is possible. Each entry is
- * satisfied by either side, because a side view always half-occludes one of them.
+ * TWO TIERS, AND THE DIFFERENCE MATTERS.
+ *
+ * `countingLandmarks` are the joints without which there is no rep to count — lose one and
+ * the product is off. `bodyLineLandmarks` are the extra joints the body line needs; lose one
+ * of THOSE and reps keep counting while form judgement stops. Conflating the two is what
+ * made a cropped pair of feet turn the whole engine off (see the amendment log in angles.ts),
+ * and the joint most likely to be cropped is the ankle: a phone propped on the floor in
+ * portrait or a laptop close to the user cuts the feet off routinely.
+ *
+ * Each entry is satisfied by either side, because a side view always half-occludes one.
  */
-export const requiredLandmarks: readonly LandmarkRequirement[] = [
+export const countingLandmarks: readonly LandmarkRequirement[] = [
   { name: 'shoulder', indices: [LEFT_SHOULDER, RIGHT_SHOULDER] },
   { name: 'elbow', indices: [LEFT_ELBOW, RIGHT_ELBOW] },
   { name: 'wrist', indices: [LEFT_WRIST, RIGHT_WRIST] },
+]
+
+export const bodyLineLandmarks: readonly LandmarkRequirement[] = [
   { name: 'hip', indices: [LEFT_HIP, RIGHT_HIP] },
   { name: 'ankle', indices: [LEFT_ANKLE, RIGHT_ANKLE] },
 ]
 
+/**
+ * Everything needed for FULL coaching: counting plus body line. Still the default for
+ * `inFrame`, so `WorkoutState.inFrame` keeps meaning "I can see all of you" — but it is no
+ * longer what decides whether a frame is usable.
+ */
+export const requiredLandmarks: readonly LandmarkRequirement[] = [
+  ...countingLandmarks,
+  ...bodyLineLandmarks,
+]
+
 export interface InFrameResult {
   inFrame: boolean
-  /** Names of unsatisfied requirements, in `requiredLandmarks` order. */
+  /** Names of unsatisfied requirements, in requirement order. */
   missing: string[]
 }
 
 /**
- * Which named joints are missing. An empty landmark array (no pose detected at all)
- * reports every requirement missing rather than pretending the user is in frame.
+ * Which of the named joints in `requirements` are missing. An empty landmark array (no pose
+ * detected at all) reports every requirement missing rather than pretending the user is in
+ * frame.
  */
-export function inFrame(
+export function inFrameFor(
   landmarks: readonly Landmark[] | null | undefined,
+  requirements: readonly LandmarkRequirement[],
   threshold: number = VISIBILITY.joint,
 ): InFrameResult {
   if (!isUsableArray(landmarks)) {
-    return { inFrame: false, missing: requiredLandmarks.map((r) => r.name) }
+    return { inFrame: false, missing: requirements.map((r) => r.name) }
   }
-  const missing = requiredLandmarks
+  const missing = requirements
     .filter((req) => !req.indices.some((i) => visibilityOf(landmarks, i) >= threshold))
     .map((req) => req.name)
 
   return { inFrame: missing.length === 0, missing }
+}
+
+/** The full-coaching set: every joint, body line included. */
+export function inFrame(
+  landmarks: readonly Landmark[] | null | undefined,
+  threshold: number = VISIBILITY.joint,
+): InFrameResult {
+  return inFrameFor(landmarks, requiredLandmarks, threshold)
+}
+
+/** Just enough of the user to count reps. This is the one that gates the engine. */
+export function countingInFrame(
+  landmarks: readonly Landmark[] | null | undefined,
+  threshold: number = VISIBILITY.joint,
+): InFrameResult {
+  return inFrameFor(landmarks, countingLandmarks, threshold)
+}
+
+/**
+ * The extra joints the body line needs. Note this is the EITHER-SIDE check, used to explain
+ * to the user which joints are off camera; the measurement itself is stricter and requires
+ * hip and ankle on the one side it measures (`bodyLineVisible` in angles.ts).
+ */
+export function bodyLineInFrame(
+  landmarks: readonly Landmark[] | null | undefined,
+  threshold: number = VISIBILITY.joint,
+): InFrameResult {
+  return inFrameFor(landmarks, bodyLineLandmarks, threshold)
 }

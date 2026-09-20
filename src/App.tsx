@@ -1,5 +1,5 @@
 /**
- * SPOTTER shell: two screens, one persona, one pose engine, one coach session.
+ * SPOTTER shell: three screens, one persona, one pose engine, one coach session.
  *
  * The inversion the whole app is built on lives in handleEvent — the pose engine
  * INITIATES (it measures and decides), the model REACTS to one line of text per
@@ -11,6 +11,13 @@
  *   coach/session     — owns the realtime socket, voice and captions
  *   coach/toolHandlers— turns model tool calls into the UI callbacks below
  * Everything else in src/ui is presentational.
+ *
+ * THE END OF A SET has two entrances and they are not exclusive — the target being
+ * reached, and the coach calling log_set because the user said they were done. Both
+ * pass through finishSet, which is latched (ui/finishGate.ts) because stopping the
+ * engine emits `set_ended` and would otherwise enter the ending screen a second time
+ * a microsecond later. Leaving the workout STOPS THE ENGINE, which is also what
+ * releases the camera: a webcam light still on after the set is over is conspicuous.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CoachEvent, WorkoutState } from './types/events'
@@ -29,6 +36,13 @@ import { createHeartRateState, repsPerMinute, step as stepHeartRate, toHeartRate
 import type { HeartRateState } from './mock/heartRate'
 import IntroScreen from './ui/IntroScreen'
 import WorkoutScreen from './ui/WorkoutScreen'
+import EndingScreen from './ui/EndingScreen'
+import { latchFinish, OPEN_LATCH } from './ui/finishGate'
+import type { FinishLatch, FinishReason } from './ui/finishGate'
+import { EMPTY_LEDGER, foldSetEvent } from './ui/setLedger'
+import type { SetLedger } from './ui/setLedger'
+import { closingLine, summariseSet } from './ui/setSummary'
+import type { SetSummary } from './ui/setSummary'
 import type { ConnState } from './ui/Hud'
 import type { FaultCandidate } from './ui/FaultChip'
 import type { Utterance } from './ui/Captions'
@@ -124,7 +138,7 @@ function writeVoiceLevel(store: { current: number }, level: number): void {
 // ------------------------------------------------------------------ the shell
 
 export default function App() {
-  const [screen, setScreen] = useState<'intro' | 'workout'>('intro')
+  const [screen, setScreen] = useState<'intro' | 'workout' | 'ending'>('intro')
   const [persona, setPersona] = useState<PersonaId>('mean')
   const [workout, setWorkout] = useState<WorkoutState>(IDLE_WORKOUT)
   const [fps, setFps] = useState(0)
@@ -150,6 +164,8 @@ export default function App() {
   const [faultCandidate, setFaultCandidate] = useState<FaultCandidate | null>(null)
   const [summary, setSummary] = useState<string | null>(null)
   const [fatal, setFatal] = useState<string | null>(null)
+  /** The finished set. Its IDENTITY drives the closing line and the avatar render. */
+  const [ending, setEnding] = useState<SetSummary | null>(null)
 
   const engineRef = useRef<PoseEngine | null>(null)
   const sessionRef = useRef<CoachSession | null>(null)
@@ -158,6 +174,17 @@ export default function App() {
   const heartRef = useRef<HeartRateState>(createHeartRateState())
   const repTimesRef = useRef<readonly number[]>([])
   const voiceRef = useRef(0)
+  /**
+   * The set, accumulated. A ref rather than state on purpose: nothing renders it until
+   * the set is over, so folding it into state would re-render the workout screen once
+   * per event for a number nobody is looking at yet.
+   */
+  const ledgerRef = useRef<SetLedger>(EMPTY_LEDGER)
+  /** Highest SIMULATED reading of the set. Published by the 5 Hz tick below. */
+  const peakBpmRef = useRef(0)
+  const finishRef = useRef<FinishLatch>(OPEN_LATCH)
+  /** Which summary has already had its closing line spoken. Exactly one push per set. */
+  const spokenForRef = useRef<SetSummary | null>(null)
 
   /**
    * Built on first use, not on mount. createMusicPlayer opens no AudioContext until
@@ -220,31 +247,89 @@ export default function App() {
     safely('persona switch', () => session.setPersona(next))
   }, [])
 
-  const handleEvent = useCallback((event: CoachEvent) => {
-    if (event.kind === 'form_fault') {
-      setFaultCandidate({ fault: event.fault, severity: event.severity, at: event.at, valueDeg: event.valueDeg })
-    } else if (event.kind === 'out_of_frame') {
-      setFaultCandidate({ fault: 'out_of_frame', severity: 'major', at: event.at })
-    } else if (event.kind === 'rep_completed') {
-      repTimesRef.current = [...repTimesRef.current, event.at]
-    } else if (event.kind === 'set_started') {
-      setSummary(null)
-      repTimesRef.current = []
-    } else if (event.kind === 'set_ended') {
-      setSummary(summarise(event.totalReps, event.cleanReps, event.faults))
-    }
+  /**
+   * The single door out of the workout, however the set ended. Latched, because every
+   * route through it stops the engine and stopping the engine emits `set_ended` — so
+   * without the latch the ending screen would be entered twice on every set.
+   */
+  const finishSet = useCallback((reason: FinishReason) => {
+    const latched = latchFinish(finishRef.current, reason)
+    // Reference comparison, not a boolean: the latch returns ITSELF when it has
+    // already closed, so "did this call win?" cannot drift from "what won".
+    if (latched === finishRef.current) return
+    finishRef.current = latched
 
     const engine = engineRef.current
-    if (engine) {
-      // Defensive copy: if the engine ever hands back its own state object React
-      // would not re-render on a mutated reference.
-      safely('pose state read', () => setWorkout({ ...engine.getState() }))
-    }
+    const target = engine?.getState().target ?? SESSION.TARGET_REPS
+    // stop() releases the camera (tracks stopped, srcObject cleared) and emits
+    // set_ended, which folds the engine's own fault list into the ledger before it is
+    // read below. The re-entry that causes is a no-op: the latch is already closed.
+    safely('pose engine stop', () => engine?.stop())
+    // Nulled so going again builds a FRESH engine, which is what makes the second set
+    // count from zero instead of resuming this one.
+    engineRef.current = null
+    // A track outlives the socket, so 35 seconds of hype would otherwise play under
+    // the verdict.
+    safely('music stop', () => sessionRef.current?.stopMusic())
 
-    const session = sessionRef.current
-    if (!session) return
-    safely('coach pushEvent', () => session.pushEvent(event))
+    setEnding(
+      summariseSet({
+        ledger: ledgerRef.current,
+        target,
+        peakBpm: peakBpmRef.current,
+        reason,
+        now: performance.now(),
+      }),
+    )
+    setScreen('ending')
   }, [])
+
+  const handleEvent = useCallback(
+    (event: CoachEvent) => {
+      // First, always: the ledger is the only record of partials, best depth and
+      // whether the body line was ever measurable. Pure fold, new object every time.
+      ledgerRef.current = foldSetEvent(ledgerRef.current, event)
+
+      if (event.kind === 'form_fault') {
+        setFaultCandidate({ fault: event.fault, severity: event.severity, at: event.at, valueDeg: event.valueDeg })
+      } else if (event.kind === 'out_of_frame') {
+        setFaultCandidate({ fault: 'out_of_frame', severity: 'major', at: event.at })
+      } else if (event.kind === 'rep_completed') {
+        repTimesRef.current = [...repTimesRef.current, event.at]
+      } else if (event.kind === 'set_started') {
+        setSummary(null)
+        repTimesRef.current = []
+      } else if (event.kind === 'set_ended') {
+        setSummary(summarise(event.totalReps, event.cleanReps, event.faults))
+      }
+
+      const engine = engineRef.current
+      if (engine) {
+        // Defensive copy: if the engine ever hands back its own state object React
+        // would not re-render on a mutated reference.
+        safely('pose state read', () => setWorkout({ ...engine.getState() }))
+      }
+
+      // The coach hears everything EXCEPT set_ended. Its wrap-up line is superseded by
+      // the ending screen's closing line, which carries the duration, the best depth,
+      // the peak pulse and the body-line caveat as well — and two wrap-ups in a row is
+      // one wrap-up too many.
+      const session = sessionRef.current
+      if (session && event.kind !== 'set_ended') {
+        safely('coach pushEvent', () => session.pushEvent(event))
+      }
+
+      // Last, so the fold and the HUD read above are already done and the summary sees
+      // the finished set.
+      if (event.kind === 'set_ended') {
+        finishSet('set_ended')
+      } else if (event.kind === 'rep_completed') {
+        const target = engine?.getState().target ?? SESSION.TARGET_REPS
+        if (event.totalReps >= target) finishSet('target_reached')
+      }
+    },
+    [finishSet],
+  )
 
   const buildRegistry = useCallback(
     (): ToolRegistry =>
@@ -261,11 +346,15 @@ export default function App() {
         },
         logSet: (args) => {
           setSummary(summarise(args.reps, args.cleanReps, args.faults))
+          // The second entrance to the ending screen: the user SAID they were done and
+          // the coach logged it. Latched against the target route, which may also have
+          // fired a moment earlier.
+          finishSet('coach_logged_set')
           return true
         },
         music: musicController,
       }),
-    [applyPersona, musicController],
+    [applyPersona, finishSet, musicController],
   )
 
   /** Synchronous on purpose: unlockAudio must run inside the START click gesture. */
@@ -330,6 +419,35 @@ export default function App() {
   }, [openSession])
 
   /**
+   * Set two, from zero. Everything that carries set-one state is reset HERE, in one
+   * place, because a counter missed from this list is a second set that silently
+   * resumes the first one.
+   *
+   * The engine is not restarted here: `engineRef` was nulled at finish, so remounting
+   * WorkoutScreen hands a fresh <video> to handleVideoReady, which builds a new engine
+   * and re-opens the camera. The socket is NOT reconnected — the coach is still live
+   * and the set_started event it is about to get is a greeting, not a reconnection.
+   */
+  const goAgain = useCallback(() => {
+    finishRef.current = OPEN_LATCH
+    ledgerRef.current = EMPTY_LEDGER
+    repTimesRef.current = []
+    peakBpmRef.current = 0
+    spokenForRef.current = null
+    // The simulation was PAUSED through the rest (its tick only runs on the workout
+    // screen), so it has no idea how long the user rested. Restarting from rest is the
+    // honest option; carrying a five-minute-stale 150 bpm into set two is not.
+    heartRef.current = createHeartRateState()
+    setEnding(null)
+    setSummary(null)
+    setFaultCandidate(null)
+    setClip(null)
+    setWorkout(IDLE_WORKOUT)
+    setFps(0)
+    setScreen('workout')
+  }, [])
+
+  /**
    * Returns true when the pose engine has CLAIMED the element and owns the camera.
    * The claim is synchronous — it lands before start() awaits getUserMedia — so
    * WorkoutScreen can suppress its fallback instead of racing the permission
@@ -371,7 +489,12 @@ export default function App() {
 
   useHotkeys({
     onSyntheticRep: () => safely('synthetic rep', () => engineRef.current?.injectSyntheticRep()),
-    onPersona: applyPersona,
+    // Frozen on the ending screen: the verdict belongs to the coach that took the set,
+    // and swapping coaches after the fact would retint the frame around another one's
+    // recorded face. The other keys stay live.
+    onPersona: (next) => {
+      if (screen !== 'ending') applyPersona(next)
+    },
     onReconnect: reconnect,
     onToggleOffline: () => setOffline((value) => !value),
     onToggleCaptions: () => setCaptionsEnabled((value) => !value),
@@ -404,6 +527,10 @@ export default function App() {
       heartRef.current = heart
       const reading = toHeartRateResult(heart)
       setHeartBeat((previous) => (sameReading(previous, reading) ? previous : reading))
+      // The peak is read once, at the end of the set. Tracked here because this is the
+      // only place the simulation is stepped, and a peak sampled anywhere else would
+      // miss whatever happened between two renders.
+      if (reading.bpm > peakBpmRef.current) peakBpmRef.current = reading.bpm
 
       const engine = engineRef.current
       if (!engine) return
@@ -432,8 +559,32 @@ export default function App() {
     }
   }, [screen])
 
+  /**
+   * STAGE 1 OF THE ENDING: the instant spoken closing line, ~600 ms away.
+   *
+   * Pushed through the session's existing public API — a typed user turn, which is the
+   * one path that is never held back by the speech policy and always draws a reply.
+   * The text is an `[EVENT]` reading (see ui/setSummary.ts) so the coach treats it as a
+   * measurement to react to rather than as something the user said, and it interrupts
+   * whatever bark was still in flight: on the ending screen the whole-set verdict IS
+   * the newest truth, and stale audio losing to it is this app's standing doctrine.
+   *
+   * Keyed on the summary's identity and guarded by a ref, so exactly one line is spoken
+   * per set no matter how many times this commits.
+   */
+  useEffect(() => {
+    if (!ending || spokenForRef.current === ending) return
+    spokenForRef.current = ending
+    const session = sessionRef.current
+    if (!session) return
+    safely('closing line', () => session.sendUserText(closingLine(ending)))
+  }, [ending])
+
   useEffect(
     () => () => {
+      // Latch BEFORE stopping: stop() emits set_ended, and entering the ending screen
+      // while React is tearing this tree down would be a state update into a corpse.
+      finishRef.current = latchFinish(finishRef.current, 'set_ended')
       safely('pose engine stop', () => engineRef.current?.stop())
       const session = sessionRef.current
       if (session) {
@@ -455,6 +606,8 @@ export default function App() {
     <div className="app" data-persona={persona} data-screen={screen}>
       {screen === 'intro' ? (
         <IntroScreen persona={persona} onPersona={applyPersona} onStart={start} target={SESSION.TARGET_REPS} />
+      ) : screen === 'ending' && ending ? (
+        <EndingScreen summary={ending} persona={persona} onAgain={goAgain} />
       ) : (
         <WorkoutScreen
           persona={persona}

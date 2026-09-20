@@ -50,6 +50,19 @@ describe('threshold configuration', () => {
   it('rejects an inverted hysteresis gap', () => {
     expect(() => validateRepThresholds({ ...REP_THRESHOLDS, upEnterDeg: 90 })).toThrow(/downEnterDeg/)
   })
+
+  it('rejects a hysteresis gap narrow enough for noise to cross', () => {
+    // The lockout recalibration spent 40 of the original 55 degrees of gap. This is the
+    // floor it stopped at: a future recalibration that keeps eating into the gap has to
+    // raise `minHysteresisGapDeg` deliberately rather than discover the noise later.
+    const narrow = REP_THRESHOLDS.downEnterDeg + REP_THRESHOLDS.minHysteresisGapDeg - 1
+    expect(() => validateRepThresholds({ ...REP_THRESHOLDS, upEnterDeg: narrow })).toThrow(
+      /hysteresis gap/,
+    )
+    expect(
+      REP_THRESHOLDS.upEnterDeg - REP_THRESHOLDS.downEnterDeg,
+    ).toBeGreaterThanOrEqual(REP_THRESHOLDS.minHysteresisGapDeg)
+  })
 })
 
 describe('depthPct', () => {
@@ -92,11 +105,24 @@ describe('hysteresis', () => {
     expect(events).toHaveLength(0)
   })
 
-  it('emits nothing while dithering across the up threshold either', () => {
-    const series = [178, 178, 178, 90]
-    for (let i = 0; i < 20; i += 1) series.push(i % 2 === 0 ? 150 : 154)
-    const { events } = driveAngles(series)
-    expect(events).toHaveLength(0)
+  /**
+   * REWRITTEN for the lockout recalibration. The old version dithered 150/154 and expected
+   * ZERO reps, which only held because `upEnterDeg` was 155 and both values sat below it —
+   * it was really asserting "a rep that never locks out is never counted", the behaviour
+   * this pass deliberately removed. The property worth guarding is the one that survives any
+   * threshold: dithering near the up threshold must not score a rep PER OSCILLATION. So the
+   * angles are now written relative to the thresholds, the first genuine ascent scores its
+   * one rep, and the twenty wobbles after it score nothing — re-entering BOTTOM requires
+   * going all the way back below `downEnterDeg`, which is exactly what the gap buys.
+   */
+  it('scores one rep for one ascent, however much it dithers across the up threshold', () => {
+    const { upEnterDeg, downEnterDeg, descentStartDeg } = REP_THRESHOLDS
+    const series = [descentStartDeg + 10, descentStartDeg + 10, descentStartDeg + 10, downEnterDeg - 10]
+    for (let i = 0; i < 20; i += 1) series.push(i % 2 === 0 ? upEnterDeg - 2 : upEnterDeg + 2)
+    const { events, state } = driveAngles(series)
+    expect(events).toHaveLength(1)
+    expect(state.totalReps).toBe(1)
+    expect(state.phase).toBe('top')
   })
 
   it('refuses a freebie rep when the engine starts with the user already down', () => {
@@ -124,7 +150,10 @@ describe('rep metrics', () => {
     expect(rep.maxElbowAngle).toBeGreaterThan(REP_THRESHOLDS.upEnterDeg)
     expect(rep.descentMs).toBeGreaterThan(0)
     expect(rep.ascentMs).toBeGreaterThan(0)
-    expect(Math.abs(rep.hipDeviationDeg)).toBeLessThan(1)
+    // Not merely "small": the fixture's ankle IS visible, so the body line was genuinely
+    // measured and null here would mean the measurement was silently dropped.
+    expect(rep.hipDeviationDeg).not.toBeNull()
+    expect(Math.abs(rep.hipDeviationDeg!)).toBeLessThan(1)
   })
 
   it('counts shallow reps and flags every one of them partial', () => {

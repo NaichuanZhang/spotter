@@ -42,10 +42,33 @@ export const FAULT_THRESHOLDS = {
   neckMinDeg: 150,
   /** Elbow abduction at or above this is flared. Front view only. */
   flareDeg: 65,
-  /** At the top of a rep, an elbow at or below this is not locked out. */
+  /**
+   * At the top of a rep, an elbow at or below this is not locked out.
+   *
+   * MUST stay above `REP_THRESHOLDS.upEnterDeg` (enforced by `validateFaultThresholds`).
+   * The band between them — 115 to 150 — is where "the rep counts AND you did not
+   * straighten up" lives, which is the whole point of making the lockout a quality flag
+   * instead of a gate. Drop this below `upEnterDeg` and every completed rep is a lockout by
+   * definition, so the fault becomes unreachable dead code.
+   */
   lockoutDeg: 150,
   /** Default bands, in degrees past the fault's own threshold. */
   severityBands: { majorAtDeg: 6, severeAtDeg: 14 } satisfies SeverityBands,
+  /**
+   * `no_lockout` gets its own, much wider bands.
+   *
+   * It is scored on how far short of `lockoutDeg` the top of the rep sat, and that distance
+   * is LARGE for ordinary humans: the real footage in `public/clips/landmarks.json` tops out
+   * at 121.7 - 151.0 degrees, i.e. 0 - 28 degrees short. Against the default bands
+   * (major at 6, severe at 14) every one of those reps would be SEVERE — and a severe fault
+   * pre-empts the utterance bucket, gets vocal emphasis and pulls up a reference clip. The
+   * coach would shout about tension-holding for an entire set and drown out the faults it
+   * can actually see.
+   *
+   * So: up to 20 degrees short is minor, 20 - 45 is major, and severe is reserved for a top
+   * around 105 degrees or lower, which is not a soft lockout but a bent-arm hover.
+   */
+  lockoutBands: { majorAtDeg: 20, severeAtDeg: 45 } satisfies SeverityBands,
   /**
    * `partial_depth` is scored against how far short of FULL depth the rep stopped,
    * not against the partial flag's own threshold — the gap between
@@ -57,6 +80,42 @@ export const FAULT_THRESHOLDS = {
     bands: { majorAtDeg: 10, severeAtDeg: 22 } satisfies SeverityBands,
   },
 } as const
+
+/**
+ * Fails fast on a fault threshold that has drifted out of step with the rep thresholds.
+ * Called at module load, the same contract as `validateRepThresholds`: these are frozen
+ * constants, so it can only fire after someone recalibrates — which is exactly when a loud
+ * failure beats a fault that has quietly become unreachable.
+ */
+export interface FaultThresholdCheck {
+  lockoutDeg: number
+  sagDeg: number
+  pikeDeg: number
+}
+
+export function validateFaultThresholds(
+  thresholds: FaultThresholdCheck = FAULT_THRESHOLDS,
+  upEnterDeg: number = REP_THRESHOLDS.upEnterDeg,
+): void {
+  const problems: string[] = []
+  if (thresholds.lockoutDeg <= upEnterDeg) {
+    problems.push(
+      `lockoutDeg (${thresholds.lockoutDeg}) must be above REP_THRESHOLDS.upEnterDeg ` +
+        `(${upEnterDeg}), otherwise every rep that completes has locked out by ` +
+        'definition and no_lockout can never fire',
+    )
+  }
+  if (thresholds.sagDeg <= 0 || thresholds.pikeDeg <= 0) {
+    // Both are compared against a MAGNITUDE, so a non-positive threshold would fire on a
+    // perfectly straight back — and on the same frame in both directions.
+    problems.push(`sagDeg (${thresholds.sagDeg}) and pikeDeg (${thresholds.pikeDeg}) must be positive`)
+  }
+  if (problems.length > 0) {
+    throw new Error(`FAULT_THRESHOLDS is inconsistent:\n - ${problems.join('\n - ')}`)
+  }
+}
+
+validateFaultThresholds()
 
 /**
  * Faults evaluated once per frame, and therefore subject to persistence tracking.
@@ -89,10 +148,19 @@ export const GATE_CONFIG = {
   persistence: {
     default: { window: 6, required: 4 } satisfies Persistence,
     /**
-     * `no_lockout` needs a much longer hold. Its per-frame condition ("at the top
-     * with a bent elbow") is also true for every descent, which passes through the
-     * band in ~300ms. 18 of 24 frames is ~600ms at 30fps — longer than any descent,
-     * short enough to catch a genuine failure to straighten up.
+     * `no_lockout` needs a much longer hold: 18 of 24 frames is ~600ms at 30fps.
+     *
+     * It USED to be needed because the per-frame condition ("at the top with a bent elbow")
+     * was also true of every descent — `phase` stays `top` down to `downEnterDeg`, so a
+     * descent from a full lockout swept the whole band. Scoring on `FaultContext.topElbow`
+     * removed that source: a top phase whose best was 180 proposes nothing however far the
+     * elbow then falls.
+     *
+     * The hold is still load-bearing for a different case. Right after a rep is scored the
+     * top-phase best IS the completion angle — just over `upEnterDeg`, so ~35 degrees short of
+     * lockout — and it climbs as the user straightens. Without the long window every rep would
+     * draw a lockout nag in the moment before the arm finished extending. 600ms is longer than
+     * that extension and shorter than a top the user genuinely parks at.
      */
     byFault: { no_lockout: { window: 24, required: 18 } } as Partial<Record<FaultType, Persistence>>,
   },
@@ -118,6 +186,25 @@ export interface FaultContext {
   phase: RepPhase
   view: CameraView
   inFrame: boolean
+  /**
+   * Best (largest) elbow angle reached so far during the CURRENT top phase —
+   * `RepMachineState.topMaxElbow`. This, not the instantaneous elbow, is what `no_lockout`
+   * is scored on, because "you did not straighten your arms" is a claim about the best the
+   * top achieved, not about wherever the arm happens to be right now.
+   *
+   * WHY IT IS NOT OPTIONAL-AS-A-DETAIL. `phase` stays `top` all the way down to
+   * `REP_THRESHOLDS.downEnterDeg`, so the descent spends ~50 degrees inside the lockout band.
+   * Scored on the instantaneous elbow, the gate fires on whichever descent frame happened to
+   * satisfy the persistence window — measured on the repo's real footage: a demonstrator whose
+   * top was 127 degrees was reported as `no_lockout 102deg SEVERE`, a number they were never
+   * at, at a severity `FAULT_THRESHOLDS.lockoutBands` explicitly reserves for "a bent-arm
+   * hover, not a soft lockout". Scored on the top-phase best it reads `127deg MAJOR`, which is
+   * true. A full lockout followed by a descent now proposes nothing at all.
+   *
+   * Absent (or null) falls back to `angles.elbow`, i.e. "treat this frame as the top-phase
+   * best" — which is what a caller handing over a single frame means.
+   */
+  topElbow?: number | null
 }
 
 /** Severity from how far past its threshold a measurement sits, in degrees. */
@@ -135,7 +222,16 @@ function reliableIn(view: CameraView): (c: FaultCandidate) => boolean {
   return (c) => FAULT_VIEW_RELIABILITY[c.fault].includes(view)
 }
 
-function hipCandidates(deviation: number): FaultCandidate[] {
+/**
+ * Sag/pike candidates, or none at all when the body line was never measured.
+ *
+ * `null` here means the hip or the ankle was off camera. Reading it as 0 would say "back
+ * perfectly straight" — the mirror image of the old bug, which extrapolated a line to an
+ * invented ankle and reported a 68-degree pike nobody performed. Either way the coach
+ * criticises or praises something it cannot see; the only honest output is silence.
+ */
+function hipCandidates(deviation: number | null): FaultCandidate[] {
+  if (deviation === null) return []
   // Sign convention comes from angles.hipDeviation: positive = sag, negative = pike.
   if (deviation >= FAULT_THRESHOLDS.sagDeg) {
     const excess = deviation - FAULT_THRESHOLDS.sagDeg
@@ -167,9 +263,15 @@ export function evaluateFaults(ctx: FaultContext): FaultCandidate[] {
     const excess = angles.flare - FAULT_THRESHOLDS.flareDeg
     out.push({ fault: 'flared_elbows', severity: severityFor(excess), valueDeg: angles.flare })
   }
-  if (phase === 'top' && angles.elbow <= FAULT_THRESHOLDS.lockoutDeg) {
-    const excess = FAULT_THRESHOLDS.lockoutDeg - angles.elbow
-    out.push({ fault: 'no_lockout', severity: severityFor(excess), valueDeg: angles.elbow })
+  // The BEST elbow of this top phase, not this frame's — see `FaultContext.topElbow`.
+  const topElbow = ctx.topElbow ?? angles.elbow
+  if (phase === 'top' && topElbow <= FAULT_THRESHOLDS.lockoutDeg) {
+    const excess = FAULT_THRESHOLDS.lockoutDeg - topElbow
+    out.push({
+      fault: 'no_lockout',
+      severity: severityFor(excess, FAULT_THRESHOLDS.lockoutBands),
+      valueDeg: topElbow,
+    })
   }
   return out.filter(reliableIn(ctx.view))
 }

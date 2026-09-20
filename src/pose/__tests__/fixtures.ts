@@ -18,9 +18,19 @@ import type { CameraView, CoachEvent } from '../../types/events'
 import type { PoseAngles } from '../angles'
 import { measureAngles } from '../angles'
 import type { GateState } from '../faults'
-import { createGateState, evaluateFaults, evaluateRepFaults, gate, noteUtterance, UTTERANCE_RANK } from '../faults'
+import {
+  canSpeak,
+  createGateState,
+  evaluateFaults,
+  evaluateRepFaults,
+  gate,
+  noteUtterance,
+  UTTERANCE_RANK,
+} from '../faults'
 import type { JointName, Landmark } from '../landmarks'
-import { LANDMARK_COUNT, LEFT_JOINTS, NOSE, RIGHT_JOINTS, SIDE_JOINTS } from '../landmarks'
+import { bodyLineInFrame, LANDMARK_COUNT, LEFT_JOINTS, NOSE, RIGHT_JOINTS, SIDE_JOINTS } from '../landmarks'
+import type { ObservabilityState } from '../observability'
+import { createObservabilityState, OBSERVABILITY, stepObservability } from '../observability'
 import type { RepMachineState } from '../repMachine'
 import { createRepMachineState, step } from '../repMachine'
 import type { AngleWindows } from '../smoothing'
@@ -240,6 +250,41 @@ export function outOfFrameSet(gapFrames = 20): Frame[] {
   return [...before, ...gap, ...after]
 }
 
+/**
+ * Reps filmed with the FEET OUT OF SHOT: shoulder, elbow and wrist tracked, hip tracked,
+ * ankles at zero visibility. This is not a contrived edge case — it is what a phone propped
+ * on the floor in portrait produces, and it is what the repo's one piece of real footage
+ * looks like (ankle above the visibility gate on 45 frames out of 578).
+ *
+ * Every rep here must COUNT, and every rep here must report `hipDeviationDeg: null`.
+ */
+export function ankleLessSet(reps = 3, options: Omit<SetOptions, 'reps'> = {}): Frame[] {
+  return buildSet({ ...options, reps }).map((frame) => ({
+    ...frame,
+    landmarks: frame.landmarks === null ? null : occludeJoints(frame.landmarks, ['ankle']),
+  }))
+}
+
+/**
+ * Reps that never straighten the arms: they top out at `softTopDeg`, below the OLD
+ * `upEnterDeg` of 155 but above the shipped one. The long top dwell is deliberate — it is
+ * what lets `no_lockout` clear its 18-of-24-frame persistence window, which is the whole
+ * point of the fixture: the rep counts AND the coach says "lock it out".
+ */
+export const SOFT_TOP = { softTopDeg: 130, dwellTopFrames: 30 } as const
+
+export function softTopSet(reps = 2): Frame[] {
+  return buildSet({
+    reps,
+    shape: {
+      ...DEFAULT_REP_SHAPE,
+      topDeg: SOFT_TOP.softTopDeg,
+      dwellTopFrames: SOFT_TOP.dwellTopFrames,
+    },
+    settleFrames: SOFT_TOP.dwellTopFrames,
+  })
+}
+
 /** A static sagging plank. For proving the gate does not narrate every frame. */
 export function heldSagFrames(count = 100, sagOffset = 0.05): Frame[] {
   return Array.from({ length: count }, (_, i) => ({
@@ -257,12 +302,15 @@ export interface PipelineOptions {
 }
 
 export interface PipelineRun {
-  /** `rep_completed` and `form_fault`, in emission order. */
+  /** `rep_completed`, `form_fault` and the observability pair, in emission order. */
   events: CoachEvent[]
   reps: RepMachineState
   gate: GateState
-  /** Frames dropped because they were not measurable. */
+  observability: ObservabilityState
+  /** Frames dropped because they were not countable. */
   skipped: number
+  /** Frames whose body line was measurable. */
+  bodyLineFrames: number
   /** Last smoothed angles, for spot checks. */
   lastAngles: PoseAngles | null
 }
@@ -284,8 +332,10 @@ export function runPipeline(frames: readonly Frame[], options: PipelineOptions =
   let reps: RepMachineState = createRepMachineState()
   let windows: AngleWindows = createAngleWindows()
   let gateState: GateState = createGateState()
+  let observability: ObservabilityState = createObservabilityState()
   const events: CoachEvent[] = []
   let skipped = 0
+  let bodyLineFrames = 0
   let lastAngles: PoseAngles | null = null
 
   for (const frame of frames) {
@@ -301,6 +351,7 @@ export function runPipeline(frames: readonly Frame[], options: PipelineOptions =
       continue
     }
     lastAngles = angles
+    if (angles.hipDeviation !== null) bodyLineFrames += 1
 
     const repResult = step(reps, { angles, t: frame.t })
     reps = repResult.state
@@ -318,15 +369,34 @@ export function runPipeline(frames: readonly Frame[], options: PipelineOptions =
     }
 
     const frameFaults = gate(gateState, {
-      candidates: evaluateFaults({ angles, phase: reps.phase, view, inFrame: true }),
+      candidates: evaluateFaults({
+        angles,
+        phase: reps.phase,
+        view,
+        inFrame: true,
+        topElbow: reps.topMaxElbow,
+      }),
       t: frame.t,
       mode: 'frame',
     })
     gateState = frameFaults.state
     events.push(...frameFaults.events)
+
+    // Same order and same shared utterance bucket as `poseEngine.processFrame`.
+    const observed = stepObservability(observability, {
+      measurable: angles.hipDeviation !== null,
+      missing: bodyLineInFrame(frame.landmarks).missing,
+      t: frame.t,
+      canSpeak: canSpeak(gateState, frame.t, OBSERVABILITY.rank),
+    })
+    observability = observed.state
+    if (observed.events.length > 0) {
+      gateState = noteUtterance(gateState, frame.t, OBSERVABILITY.rank)
+      events.push(...observed.events)
+    }
   }
 
-  return { events, reps, gate: gateState, skipped, lastAngles }
+  return { events, reps, gate: gateState, observability, skipped, bodyLineFrames, lastAngles }
 }
 
 // ------------------------------------------------------------------ assertions aid

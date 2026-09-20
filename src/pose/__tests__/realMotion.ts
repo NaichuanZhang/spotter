@@ -58,7 +58,31 @@ interface StoredCycle {
   readonly minElbowAngle: number
   readonly maxElbowAngle: number
   readonly amplitudeDeg: number
+  readonly depthPct: number
+  readonly partial: boolean
+  /** False when no frame of the cycle had a visible ankle, so no body line was measurable. */
+  readonly bodyLineMeasurable: boolean
+  /** Frames of the cycle that produced a hip deviation. 0 on this footage. */
+  readonly hipFrames: number
   readonly meetsAppLockout: boolean
+}
+
+/**
+ * A run of consecutive frames from ONE continuous camera take.
+ *
+ * The source is an EDITED tutorial video: it cuts between angles four times. The
+ * extraction detected those cuts (a body-length jump between adjacent frames) and
+ * recorded them here, which is the only reason a replay can be honest. Splicing two
+ * takes together hands the rep machine an elbow discontinuity no live camera can
+ * produce, and a discontinuity that lands between `downEnterDeg` and `upEnterDeg`
+ * manufactures a rep out of an edit. See `segmentedFrames`.
+ */
+interface StoredSegment {
+  readonly index: number
+  readonly startFrame: number
+  readonly endFrame: number
+  readonly frameCount: number
+  readonly bodyLineMeasurableFrames: number
 }
 
 export interface RealMotionFixture {
@@ -78,6 +102,8 @@ export interface RealMotionFixture {
   readonly minAmplitudeDeg: number
   /** The pushup cycles the relaxed pass found, in frame order. */
   readonly cycles: readonly StoredCycle[]
+  /** Continuous camera takes, in frame order. The gaps between them are scene cuts. */
+  readonly segments: readonly StoredSegment[]
   /** Frame range of the chosen exemplar rep, for slicing `frames`. */
   readonly exemplar: { readonly startFrame: number; readonly endFrame: number; readonly minElbowAngle: number }
 }
@@ -156,7 +182,25 @@ function toCycle(value: unknown): StoredCycle {
     minElbowAngle: asNumber(rep.minElbowAngle, 'rep minElbowAngle'),
     maxElbowAngle: asNumber(rep.maxElbowAngle, 'rep maxElbowAngle'),
     amplitudeDeg: asNumber(rep.amplitudeDeg, 'rep amplitudeDeg'),
+    depthPct: asNumber(rep.depthPct, 'rep depthPct'),
+    partial: rep.partial === true,
+    bodyLineMeasurable: rep.bodyLineMeasurable === true,
+    hipFrames: asNumber(rep.hipFrames, 'rep hipFrames'),
     meetsAppLockout: rep.meetsAppLockout === true,
+  }
+}
+
+function toSegment(value: unknown): StoredSegment {
+  const segment = asRecord(value, 'entry in `segments`')
+  return {
+    index: asNumber(segment.index, 'segment index'),
+    startFrame: asNumber(segment.startFrame, 'segment startFrame'),
+    endFrame: asNumber(segment.endFrame, 'segment endFrame'),
+    frameCount: asNumber(segment.frameCount, 'segment frameCount'),
+    bodyLineMeasurableFrames: asNumber(
+      segment.bodyLineMeasurableFrames,
+      'segment bodyLineMeasurableFrames',
+    ),
   }
 }
 
@@ -207,6 +251,7 @@ export function loadRealMotion(): RealMotionFixture {
     relaxedUpEnterDeg: asNumber(usedPass.upEnterDeg, '`used.upEnterDeg`'),
     minAmplitudeDeg: asNumber(usedPass.minAmplitudeDeg, '`used.minAmplitudeDeg`'),
     cycles: asArray(root.reps, '`reps`').map(toCycle),
+    segments: asArray(root.segments, '`segments`').map(toSegment),
     exemplar: {
       startFrame: asNumber(exemplarStats.startFrame, '`good_rep.stats.startFrame`'),
       endFrame: asNumber(exemplarStats.endFrame, '`good_rep.stats.endFrame`'),
@@ -217,28 +262,82 @@ export function loadRealMotion(): RealMotionFixture {
 }
 
 /**
+ * The fixture's frames grouped into the source video's continuous takes, oldest first.
+ *
+ * THIS, NOT `fixture.frames`, IS THE FAITHFUL REPLAY. `frames` is the concatenation of
+ * four camera takes with the cuts removed, and the rep machine cannot tell an edit from
+ * a movement: across the two cut boundaries in this clip the spliced elbow signal dives
+ * from a lockout into the bottom band and back out again, and the machine scores TWO reps
+ * that the demonstrator never performed (8 instead of 6, at any `upEnterDeg` <= 122).
+ * A live camera never produces that discontinuity. Replaying per take — a fresh machine
+ * and a fresh median window for each, exactly as if the camera had been stopped and
+ * restarted — is the only reading that measures the motion instead of the edit.
+ *
+ * Frames are matched to takes by SOURCE frame number, never by slicing `frames`: the
+ * extraction dropped frames the detector failed on, so index and frame number run apart.
+ */
+export function segmentedFrames(fixture: RealMotionFixture = loadRealMotion()): readonly Frame[][] {
+  return fixture.segments.map((segment) =>
+    fixture.frames.filter((_, position) => {
+      const sourceFrame = fixture.sourceFrames[position]!
+      return sourceFrame >= segment.startFrame && sourceFrame <= segment.endFrame
+    }),
+  )
+}
+
+/**
  * MEASURED BY THIS TEST SUITE, not by the extraction — the numbers the live `src/pose`
  * code produces when it replays the fixture. They are written down so that a change in
  * the pipeline shows up as a diff here instead of quietly moving.
  *
- * WHY THEY LOOK LIKE A FAILURE: they are one. The demonstrator in the source video holds
- * tension and never straightens their arms, so the app's `upEnterDeg` of 155 is never
- * reached and NOT ONE of their six real pushups is counted. See the test for the full
- * argument and for what would have to change.
+ * AMENDED (ankle-decoupling + lockout recalibration pass). These numbers used to record a
+ * total failure — zero of six pushups counted — and the file argued at length that fixing
+ * it was a calibration decision no test got to make. The decision has now been made
+ * deliberately, against this footage: `upEnterDeg` moved 155 -> 115 and the body line
+ * stopped being fabricated from an off-frame ankle. The measured numbers below moved with
+ * it, and `repsScoredByAppThresholds` in the JSON (0) is now a record of the OLD
+ * thresholds rather than of what the app does — `repsScoredWithShippedThresholds` is the
+ * live number. See realMotionReps.test.ts for the argument.
  */
 export const MEASURED = {
-  /** Every emitted frame is measurable — `measureAngles` returns non-null for all of them. */
+  /** Every emitted frame is measurable for COUNTING — `measureAngles` returns non-null. */
   frameCount: 578,
   unmeasurableFrames: 0,
   /**
-   * Frames satisfying `requiredLandmarks` (which includes an ankle). The source is a
-   * portrait crop that cuts the feet off, so this is 8% of the clip.
+   * Frames satisfying `requiredLandmarks` (the full-coaching set, ankle included). The
+   * source is a portrait crop that cuts the feet off, so this is 8% of the clip — and it
+   * is why the body line is unmeasurable here while every rep still counts.
    */
   inFrameFrames: 45,
-  /** Reps the real rep machine scores. Zero, and that is the finding. */
-  repsScored: 0,
+  /** Frames on which `measureAngles` returns a non-null `hipDeviation`. Same 45. */
+  bodyLineFrames: 45,
+  /** Reps the shipped thresholds score, replayed one continuous take at a time. */
+  repsScored: 6,
+  /**
+   * ...and what the SAME code scores when the four takes are spliced back together, which
+   * is what `fixture.frames` is. The two extra reps are edits, not pushups: see
+   * `segmentedFrames`. Recorded so nobody "fixes" the segmented replay into this one.
+   */
+  repsScoredAcrossCuts: 8,
+  /**
+   * What the pre-recalibration thresholds scored: none of the six. Kept as history, and as
+   * the reason `upEnterDeg` moved. `repDetection.appThresholds.repsScored` in the JSON is
+   * this number, so the JSON no longer describes the shipped code.
+   */
+  repsScoredByOldLockoutDeg: { upEnterDeg: 155, repsScored: 0 },
+  /**
+   * `form_unobservable` utterances across the four takes, replayed per take. Three of them:
+   * one each for the takes long enough to clear the debounce, none for the 8-frame take.
+   * Against 578 frames, i.e. the signal is debounced by a factor of ~190.
+   */
+  unobservableUtterances: 3,
   /** Highest smoothed elbow angle at the top of any of the six cycles. */
   highestCycleTopDeg: 151.0,
+  /**
+   * ...and the LOWEST, which is the number `upEnterDeg` had to clear. The whole
+   * recalibration is the distance between this and 155.
+   */
+  lowestCycleTopDeg: 121.7,
   /** Deepest smoothed elbow angle across the clip. */
   deepestElbowDeg: 10.7,
   /** Tolerance for comparing a replayed angle against a recorded one, in degrees. */

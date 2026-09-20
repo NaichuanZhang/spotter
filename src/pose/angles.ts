@@ -10,9 +10,61 @@
  * below depends on that and is the single easiest thing in this codebase to invert.
  *
  * TUNABLES LIVE IN: `GEOMETRY` (this file).
+ *
+ * ── CONTRACT AMENDMENT LOG ──────────────────────────────────────────────────
+ * `PoseAngles` is consumed by the rep machine, the fault gate, the smoother and the
+ * engine, so its shape is contract even though it does not live in src/types. It is
+ * changed by deliberate amendment, recorded here.
+ *
+ * 1. `bodyLine` and `hipDeviation` became NULLABLE, and `measureAngles` stopped
+ *    requiring an ankle (ankle-decoupling pass). MEASURABILITY IS NOT VALIDITY:
+ *
+ *      - counting a rep needs shoulder + elbow + wrist,
+ *      - judging the body line ADDITIONALLY needs hip + ankle.
+ *
+ *    Before this, `measureAngles` demanded all five through one `pickSide` call and
+ *    returned null for the WHOLE frame when the ankle was missing, so a phone propped
+ *    on the floor or a laptop close to the user — both of which crop the feet — turned
+ *    the entire product off. Measured on `public/clips/landmarks.json` (578 frames of
+ *    real pushups through this repo's own detector): shoulder, elbow and hip were
+ *    visible on 594/594 detections and the wrist on 592, while the ANKLE cleared the
+ *    0.5 visibility gate on 45 and had a median visibility of 0.14, with x reaching
+ *    1.27 — a joint the detector placed outside the frame.
+ *
+ *    The second half of the amendment matters more than the first. `hipDeviation`
+ *    gated on finiteness and horizontal span but never on ankle VISIBILITY, so it
+ *    extrapolated the shoulder->ankle line to that invented ankle and reported a body
+ *    line anyway: replaying the clip produced a SEVERE `piked_hips` at 68.3 degrees,
+ *    which no spine can do. A guessed ankle does not produce a missing fault, it
+ *    produces an INVENTED one, and the coach criticises form it cannot see. So the
+ *    honest answer is null, and null is now representable.
+ *
+ *    Callers must treat null as UNKNOWN, never as 0: zero degrees of deviation means
+ *    "straight back", which is a claim. `repMachine` tracks body-line measurability
+ *    explicitly for this reason, and `toEventLine` makes no hip claim without it.
+ *
+ * 2. `elbowFlare` STOPPED FALLING BACK to a low-confidence side, so `PoseAngles.flare` is now
+ *    null when neither arm has elbow + shoulder + hip genuinely visible (end-to-end
+ *    verification pass).
+ *
+ *    Amendment 1 gated the body line and the neck on visibility but left `elbowFlare`'s
+ *    fall-back in place, and that fall-back resolved its side through `pickSide`, which scores
+ *    on a MEAN — so an invisible hip beside a well-tracked elbow and shoulder still produced a
+ *    side, and `triple` then happily read the coordinate MediaPipe had invented for the hip.
+ *    Measured: with the hip at zero visibility, `elbowFlare` returned the same 81.41 degrees as
+ *    with the hip visible, and `evaluateFaults` in the front view rated that
+ *    `flared_elbows SEVERE`. The same invented-joint-invents-a-fault failure as the 68-degree
+ *    "pike", one limb over, and the front view is exactly where it bites: a camera in front of
+ *    the user has the torso between it and the hips.
+ *
+ * 3. `PoseAngles` gained no field here, but `smoothing.smoothedAngles` now gates `neck` and
+ *    `flare` on the RAW frame the way it already gated the body line, which is what makes
+ *    their nullability mean anything downstream. Recorded here because it is what the shape
+ *    above promises: reading the median window alone republished a dead angle forever
+ *    (measured: `craned_neck` proposed on 70 frames out of 70 after the ear left the shot).
  */
 
-import type { Landmark, Point2, Side, SideJoints } from './landmarks'
+import type { JointName, Landmark, Point2, Side, SideJoints } from './landmarks'
 import { pickSide, SIDE_JOINTS, VISIBILITY, visibilityOf } from './landmarks'
 
 export const GEOMETRY = {
@@ -31,6 +83,43 @@ export const GEOMETRY = {
    * frame (standing, or camera rotated) and this is not a pushup view.
    */
   minBodySpanX: 0.08,
+} as const
+
+/**
+ * WHICH JOINTS EACH MEASUREMENT NEEDS. The split is the whole point: a frame can be
+ * perfectly countable and still say nothing about the body line.
+ */
+export const MEASURABILITY = {
+  /** Without these there is no elbow angle, so there is no rep to count. */
+  counting: ['shoulder', 'elbow', 'wrist'] as const satisfies readonly JointName[],
+  /**
+   * Every joint the body line reads, checked against `VISIBILITY.joint` on the MEASURED
+   * side — not merely for finiteness: MediaPipe hands back a confident-looking coordinate
+   * for a foot that is off frame, and an extrapolation through it invents sag.
+   *
+   * The shoulder appears here as well as in `counting` on purpose. `pickSide` clears a side
+   * on the MEAN visibility of the counting joints, so a well-tracked elbow and wrist can
+   * carry a barely-seen shoulder — fine for an elbow angle whose vertex is the elbow,
+   * not fine for a line anchored at the shoulder.
+   */
+  bodyLine: ['shoulder', 'hip', 'ankle'] as const satisfies readonly JointName[],
+  /**
+   * The neck angle is ear -> shoulder -> hip, so it needs the ear AND the hip. Same hazard
+   * as the body line, one joint further up: an invented hip produces an invented
+   * `craned_neck`, and the coach criticises a head position it cannot see.
+   */
+  neck: ['ear', 'shoulder', 'hip'] as const satisfies readonly JointName[],
+  /**
+   * Elbow abduction is elbow -> shoulder -> hip, so it needs the hip too — and it is the
+   * measurement most likely to be asked for when the hip is NOT there, because it is the
+   * front-view fault and a front view puts the torso between the camera and the hips.
+   *
+   * MEASURED: before this was enforced, dropping the hip to zero visibility left
+   * `elbowFlare` returning the identical 81.41 degrees it returned with the hip visible, and
+   * `evaluateFaults` in the front view turned that into `flared_elbows SEVERE`. Exactly the
+   * fabricated-ankle bug one limb over.
+   */
+  flare: ['elbow', 'shoulder', 'hip'] as const satisfies readonly JointName[],
 } as const
 
 const RAD_TO_DEG = 180 / Math.PI
@@ -159,12 +248,18 @@ export function neckAngle(
  * With no explicit side it returns the WORST (largest) of the two arms rather than
  * using `pickSide`: in a front view both arms are equally visible, so pickSide
  * would choose between them on visibility noise and report a random arm.
+ *
+ * NULL when NEITHER arm has elbow + shoulder + hip genuinely visible. There is deliberately
+ * no fall-back to a low-confidence side: this angle is anchored at the hip, and the fall-back
+ * that used to be here measured the flare against a hip the detector had invented (see
+ * `MEASURABILITY.flare`). An explicit `side` still bypasses the gate, because the caller has
+ * then asserted which limb it wants measured.
  */
 export function elbowFlare(
   landmarks: readonly Landmark[] | null | undefined,
   side?: Side,
 ): number | null {
-  const names = ['elbow', 'shoulder', 'hip'] as const
+  const names = MEASURABILITY.flare
   if (side) {
     const pts = triple(landmarks, SIDE_JOINTS[side], names)
     return pts ? angleAt(pts[0], pts[1], pts[2]) : null
@@ -179,11 +274,7 @@ export function elbowFlare(
     })
     .filter((v): v is number => v !== null)
 
-  if (perSide.length > 0) return Math.max(...perSide)
-  // Neither arm clears the visibility gate on its own: fall back to a single side.
-  const joints = jointsFor(landmarks, undefined, names)
-  const pts = triple(landmarks, joints, names)
-  return pts ? angleAt(pts[0], pts[1], pts[2]) : null
+  return perSide.length > 0 ? Math.max(...perSide) : null
 }
 
 /**
@@ -229,43 +320,98 @@ export function hipDeviation(
 
 /**
  * Every angle for one frame, measured on ONE side so they are mutually consistent.
- * `neck` and `flare` are nullable because losing an ear or an occluded far arm must
- * not throw away a frame that can still count reps.
+ *
+ * ONLY `side` AND `elbow` ARE GUARANTEED. Everything else is nullable, because losing a
+ * joint must cost exactly the measurements that joint carried and nothing more: a frame
+ * with no ankle can still count a rep, a frame with no ear can still judge the body line.
+ * See the amendment log at the top of this file for what a non-null body line is worth
+ * and why a fabricated one is worse than none.
  */
 export interface PoseAngles {
   side: Side
   /** Degrees. Drives the rep machine. */
   elbow: number
-  /** Degrees, unsigned. 180 = straight plank. */
-  bodyLine: number
-  /** Degrees, SIGNED. Positive = sag, negative = pike. See `hipDeviation`. */
-  hipDeviation: number
+  /**
+   * Degrees, unsigned. 180 = straight plank. NULL when hip + ankle were not both visible
+   * on the measured side, i.e. the body line was never seen. Never a stand-in value.
+   */
+  bodyLine: number | null
+  /**
+   * Degrees, SIGNED. Positive = sag, negative = pike. See `hipDeviation`. NULL when
+   * unmeasurable — and 0 is a MEASUREMENT (a straight back), so the two must not be
+   * conflated anywhere downstream.
+   */
+  hipDeviation: number | null
+  /**
+   * Degrees. Ear -> shoulder -> hip, ~180 neutral. NULL when the ear or the hip was not
+   * visible on the measured side.
+   */
   neck: number | null
+  /**
+   * Degrees. Elbow abduction, worst of the two arms. NULL when NEITHER arm had elbow +
+   * shoulder + hip visible — never measured off an invented hip. See amendment 2.
+   */
   flare: number | null
 }
 
 /**
- * The single entry point the engine uses. Returns null when the frame is not
- * measurable — no pose, occluded core joints, or a non-pushup camera geometry.
- * A null frame must be SKIPPED, never coerced to zeros: zeros look like a perfect
+ * Whether every named joint is genuinely visible on ONE side.
+ *
+ * The other side is deliberately NOT substituted for a missing joint. In a true side view
+ * the two project close together, but mixing a right ankle into a left-side chain measures
+ * a body that is not there — the same reason `pickSide` refuses to average the two sides.
+ */
+export function jointsVisible(
+  landmarks: readonly Landmark[] | null | undefined,
+  side: Side,
+  names: readonly (keyof SideJoints)[],
+): boolean {
+  if (!landmarks) return false
+  const joints = SIDE_JOINTS[side]
+  return names.every((name) => visibilityOf(landmarks, joints[name]) >= VISIBILITY.joint)
+}
+
+/** The body line is honest only when shoulder, hip and ankle are all really there. */
+export function bodyLineVisible(
+  landmarks: readonly Landmark[] | null | undefined,
+  side: Side,
+): boolean {
+  return jointsVisible(landmarks, side, MEASURABILITY.bodyLine)
+}
+
+/**
+ * The single entry point the engine uses. Returns null only when the frame cannot be
+ * COUNTED — no pose, or shoulder/elbow/wrist not tracked well enough to give an elbow
+ * angle. A null frame must be SKIPPED, never coerced to zeros: zeros look like a perfect
  * rep at full depth and would fabricate reps out of an empty room.
+ *
+ * A frame that is countable but whose feet are out of shot comes back with `bodyLine` and
+ * `hipDeviation` NULL. That is the honest answer and it is a different thing from a null
+ * frame: the rep still counts, the back is simply not on camera. `bodyLine` is nulled
+ * together with `hipDeviation` because an unsigned corner angle with no side to it cannot
+ * tell a sag from a pike (that is the entire reason `hipDeviation` exists), so publishing
+ * one without the other would only invite a caller to branch on it.
  */
 export function measureAngles(landmarks: readonly Landmark[] | null | undefined): PoseAngles | null {
-  const pick = pickSide(landmarks, ['shoulder', 'elbow', 'wrist', 'hip', 'ankle'])
+  const pick = pickSide(landmarks, MEASURABILITY.counting)
   if (!pick) return null
 
   const elbow = elbowAngle(landmarks, pick.side)
-  const bodyLine = bodyLineAngle(landmarks, pick.side)
-  const deviation = hipDeviation(landmarks, pick.side)
-  if (elbow === null || bodyLine === null || deviation === null) return null
+  if (elbow === null) return null
+
+  const deviation = bodyLineVisible(landmarks, pick.side) ? hipDeviation(landmarks, pick.side) : null
 
   return {
     side: pick.side,
     elbow,
-    bodyLine,
+    bodyLine: deviation === null ? null : bodyLineAngle(landmarks, pick.side),
     hipDeviation: deviation,
-    neck: neckAngle(landmarks, pick.side),
-    // Deliberately un-sided: worst of both arms. See `elbowFlare`.
+    // Gated for the same reason as the body line: the neck angle is anchored at the hip.
+    neck: jointsVisible(landmarks, pick.side, MEASURABILITY.neck)
+      ? neckAngle(landmarks, pick.side)
+      : null,
+    // Deliberately un-sided: worst of both arms. See `elbowFlare`, which does its own
+    // per-side visibility filtering.
     flare: elbowFlare(landmarks),
   }
 }

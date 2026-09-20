@@ -100,15 +100,16 @@ export function createAngleWindows(size: number = SMOOTHING.windowSize): AngleWi
 }
 
 /**
- * Push one frame of angles. Nullable angles (`neck`, `flare`) simply do not extend
- * their window on frames where they were unmeasurable, so a briefly lost ear does
- * not blank the neck signal.
+ * Push one frame of angles. A nullable angle simply does not extend its window on a
+ * frame where it was unmeasurable, so a briefly lost ear does not blank the neck
+ * signal and a one-frame ankle dropout does not blank the body line.
  */
 export function pushAngles(windows: AngleWindows, angles: PoseAngles): AngleWindows {
   return {
     elbow: pushSample(windows.elbow, angles.elbow),
-    bodyLine: pushSample(windows.bodyLine, angles.bodyLine),
-    hipDeviation: pushSample(windows.hipDeviation, angles.hipDeviation),
+    bodyLine: angles.bodyLine === null ? windows.bodyLine : pushSample(windows.bodyLine, angles.bodyLine),
+    hipDeviation:
+      angles.hipDeviation === null ? windows.hipDeviation : pushSample(windows.hipDeviation, angles.hipDeviation),
     neck: angles.neck === null ? windows.neck : pushSample(windows.neck, angles.neck),
     flare: angles.flare === null ? windows.flare : pushSample(windows.flare, angles.flare),
   }
@@ -118,20 +119,39 @@ export function pushAngles(windows: AngleWindows, angles: PoseAngles): AngleWind
  * Median-filtered angles for the current window state. `side` is carried through
  * from the raw frame — it is a label, not a measurement, so it is not smoothed.
  *
- * Returns null when the essential angles have no samples at all.
+ * Returns null only when the ELBOW has no samples, since that is the one angle without
+ * which there is nothing to count.
+ *
+ * EVERY NULLABLE ANGLE IS GATED ON THE RAW FRAME, not on its window. A window that still
+ * holds samples keeps returning a median forever, so reading the window alone would keep
+ * publishing an angle for as long as the session lasts after the joint that produced it left
+ * the shot — a stale number presented as a live measurement, which is the exact failure the
+ * ankle-decoupling pass exists to remove. When the raw frame does not have the angle, neither
+ * does the smoothed one.
+ *
+ * MEASURED, and the reason the gate is not body-line-specific: with this gate applied only to
+ * `bodyLine`/`hipDeviation`, occluding the ear from frame 10 of a 70-frame sequence left
+ * `smoothedAngles().neck` reporting 175.5 degrees on all 60 subsequent frames, and on a
+ * craned-neck pose it produced a `craned_neck` candidate on 70 frames out of 70 AFTER the ear
+ * was gone. The coach would have criticised a head position that was not on camera, for the
+ * rest of the set, off one value measured seconds earlier. Same hazard as the fabricated hip
+ * deviation, same answer: an honest null.
+ *
+ * The windows are NOT cleared. A flickering joint would then reset them every few frames and
+ * the angle would arrive unfiltered; spanning a short gap with at most `windowSize - 1` older
+ * real samples is the cheaper error, and three fresh samples are enough to put the median back
+ * inside the fresh range (~66ms at 30fps).
  */
 export function smoothedAngles(windows: AngleWindows, raw: PoseAngles): PoseAngles | null {
   const elbow = median(windows.elbow)
-  const bodyLine = median(windows.bodyLine)
-  const hipDeviation = median(windows.hipDeviation)
-  if (elbow === null || bodyLine === null || hipDeviation === null) return null
+  if (elbow === null) return null
 
   return {
     side: raw.side,
     elbow,
-    bodyLine,
-    hipDeviation,
-    neck: median(windows.neck),
-    flare: median(windows.flare),
+    bodyLine: raw.bodyLine === null ? null : median(windows.bodyLine),
+    hipDeviation: raw.hipDeviation === null ? null : median(windows.hipDeviation),
+    neck: raw.neck === null ? null : median(windows.neck),
+    flare: raw.flare === null ? null : median(windows.flare),
   }
 }

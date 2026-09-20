@@ -20,6 +20,9 @@ import { createMusicPlayer, MUSIC_CONFIG } from '../musicPlayer'
 import type { DuckReason } from '../musicPlayer'
 import { DUCK_REASONS, duckReasonsFor, NO_DUCK, syncDuck } from '../musicControl'
 import type { MusicDucker } from '../musicControl'
+import { createDuckLoop, micLevelStep, sameMicState } from '../duckLoop'
+import { MIC_OFF } from '../micUplink'
+import type { MicState } from '../micUplink'
 
 // ── fake Web Audio, just enough of it ──────────────────────────────────────────
 
@@ -232,5 +235,117 @@ describe('syncDuck reports both edges, every time', () => {
     const previous: Readonly<Record<DuckReason, boolean>> = { coach: true, mic: false }
     syncDuck(ducker, previous, { coach: false, mic: true })
     expect(previous).toEqual({ coach: true, mic: false })
+  })
+})
+
+// ── the loop the session actually runs ────────────────────────────────────────
+
+function loopHarness(music?: MusicDucker) {
+  const ticks: (() => void)[] = []
+  const state = { speaking: false, mic: { ...MIC_OFF } as MicState }
+  const published: MicState[] = []
+  const loop = createDuckLoop({
+    isCoachSpeaking: () => state.speaking,
+    getMicState: () => state.mic,
+    music,
+    onMicState: (next) => published.push(next),
+    setInterval: (handler) => {
+      ticks.push(handler)
+      return ticks.length
+    },
+    clearInterval: () => {
+      ticks.length = 0
+    },
+  })
+  loop.start()
+  return { loop, state, published, tick: () => ticks.forEach((handler) => handler()) }
+}
+
+const micState = (over: Partial<MicState>): MicState => ({ ...MIC_OFF, ...over })
+
+describe('createDuckLoop: the two reasons, polled', () => {
+  it('ducks for the coach and for the armed mic, and restores only when both clear', () => {
+    const { ducker, calls } = fakeDucker()
+    const { state, tick } = loopHarness(ducker)
+
+    state.speaking = true
+    tick()
+    expect(calls).toEqual(['coach=true'])
+
+    state.mic = micState({ capturing: true, armed: true, level: 0.3 })
+    tick()
+    expect(calls).toEqual(['coach=true', 'mic=true'])
+
+    // The coach finishes but the user is still talking. A single boolean would restore
+    // full volume here, straight over the top of the user.
+    state.speaking = false
+    tick()
+    expect(calls).toEqual(['coach=true', 'mic=true', 'coach=false'])
+
+    state.mic = micState({ capturing: true, armed: false })
+    tick()
+    expect(calls).toEqual(['coach=true', 'mic=true', 'coach=false', 'mic=false'])
+  })
+
+  it('reads armed, not capturing: a gated mic is not listening', () => {
+    const { ducker, calls } = fakeDucker()
+    const { state, tick } = loopHarness(ducker)
+    state.mic = micState({ capturing: true, gated: true, armed: false })
+    tick()
+    expect(calls).toEqual([])
+  })
+
+  it('publishes a material mic change but damps level jitter', () => {
+    const { published, state, tick } = loopHarness()
+    state.mic = micState({ capturing: true, armed: true, level: 0.30 })
+    tick()
+    expect(published).toHaveLength(1)
+
+    // Inside one quantisation step: the HUD meter cannot show this, so nothing renders.
+    state.mic = micState({ capturing: true, armed: true, level: 0.31 })
+    tick()
+    expect(published).toHaveLength(1)
+
+    state.mic = micState({ capturing: true, armed: true, level: 0.6 })
+    tick()
+    expect(published).toHaveLength(2)
+  })
+
+  it('publishes a mic failure even though the level did not move', () => {
+    const { published, state, tick } = loopHarness()
+    state.mic = micState({ error: { code: 'mic_denied', message: 'denied' } })
+    tick()
+    expect(published.at(-1)?.error?.code).toBe('mic_denied')
+  })
+
+  it('releases every reason on stop, and then stops ticking', () => {
+    const { ducker, calls } = fakeDucker()
+    const { loop, state, tick } = loopHarness(ducker)
+    state.speaking = true
+    state.mic = micState({ capturing: true, armed: true })
+    tick()
+    calls.length = 0
+
+    loop.stop()
+    expect(calls).toEqual(['coach=false', 'mic=false'])
+
+    calls.length = 0
+    tick()
+    expect(calls).toEqual([])
+  })
+
+  it('works with no music at all — it still publishes mic state', () => {
+    const { published, state, tick } = loopHarness(undefined)
+    state.mic = micState({ capturing: true })
+    tick()
+    expect(published).toHaveLength(1)
+  })
+
+  it('quantises the level the same way in both directions', () => {
+    expect(micLevelStep(0)).toBe(0)
+    expect(micLevelStep(Number.NaN)).toBe(0)
+    expect(micLevelStep(-1)).toBe(0)
+    expect(micLevelStep(5)).toBe(micLevelStep(1))
+    expect(sameMicState(MIC_OFF, MIC_OFF)).toBe(true)
   })
 })

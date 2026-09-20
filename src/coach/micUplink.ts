@@ -11,11 +11,19 @@
  *    would cut the user off mid-sentence, and adding a response.create would make the
  *    coach answer twice. Confirmed live: the server emits
  *    `input_audio_buffer.committed` ITSELF once its VAD decides the turn ended.
- * 2. THE GATE IS THE COACH'S VOICE. `gateOpen` returns false while audioOut is
- *    speaking, because the mic and the speakers are in the same room: left open, the
- *    model hears itself, server VAD scores it as a user turn, and the coach starts
- *    answering its own last sentence. See audioIn.ts's header for why half-duplex is
- *    the right trade and what it costs (no barge-in).
+ * 2. THE GATE IS THE COACH'S VOICE — UNLESS THE USER IS CLEARLY TALKING. `gateOpen`
+ *    returns false while audioOut is speaking, because the mic and the speakers are in
+ *    the same room: left open, the model hears itself, server VAD scores it as a user
+ *    turn, and the coach starts answering its own last sentence. See audioIn.ts's
+ *    header for why half-duplex is the right trade.
+ *
+ *    The one exception is BARGE-IN. Capture never stopped while the gate was shut — only
+ *    transmission did — so the level of the buffers being discarded is evidence, and
+ *    `bargeIn.ts` turns sustained evidence into a decision. On a trigger this module
+ *    stops the coach (`interruptCoach`), force-holds the gate open for a bounded window,
+ *    replays the pre-roll so the first words are not lost, and then resumes appending.
+ *    Everything about it is guarded and switchable, because a coach that interrupts
+ *    ITSELF is much worse than one you have to wait for: see BARGE_IN_TUNING.
  * 3. A DENIED MIC IS NOT AN OUTAGE. The pose-driven one-way coaching is the product;
  *    two-way is additive. `start()` therefore never rejects — it records the failure,
  *    reports it once, and leaves the app running with a visible OFF indicator.
@@ -53,8 +61,17 @@
  * the end of a turn explicit instead of inferred.
  */
 
-import { AUDIO_IN_CONFIG, AudioInError, createAudioIn } from './audioIn'
-import type { AudioIn, AudioInErrorCode, AudioInOptions } from './audioIn'
+import { AUDIO_IN_BUFFER_PERIOD_MS, AUDIO_IN_CONFIG, AudioInError, createAudioIn } from './audioIn'
+import type { AudioIn, AudioInBuffer, AudioInErrorCode, AudioInOptions } from './audioIn'
+import {
+  BARGE_IN_TUNING,
+  gateHeldOpen,
+  INITIAL_BARGE_IN,
+  observeLevel,
+  preRollBuffers,
+  triggerLevel,
+} from './bargeIn'
+import type { BargeInState, BargeInTuning } from './bargeIn'
 
 export const UPLINK_CONFIG = {
   /**
@@ -102,8 +119,11 @@ export function isWithinAppendLimit(base64Pcm: string): boolean {
   return base64Pcm.length > 0 && base64Pcm.length <= UPLINK_CONFIG.maxAppendBytes
 }
 
-/** One audioIn buffer, in ms. ~85 ms at 2048 frames / 24 kHz. */
-export const BUFFER_PERIOD_MS = (AUDIO_IN_CONFIG.bufferSize / AUDIO_IN_CONFIG.sampleRate) * 1000
+/**
+ * One audioIn buffer, in ms. ~85 ms at 2048 frames / 24 kHz. Derived in audioIn, which owns
+ * both numbers, and re-exported here because this module's callers already import it.
+ */
+export const BUFFER_PERIOD_MS = AUDIO_IN_BUFFER_PERIOD_MS
 
 /** Derived, never hand-counted, so changing bufferSize cannot silently shorten the flush. */
 export const SILENCE_FLUSH_BUFFERS = Math.ceil(UPLINK_CONFIG.silenceFlushMs / BUFFER_PERIOD_MS)
@@ -157,6 +177,26 @@ export interface MicUplinkOptions {
   readonly send: (frame: Record<string, unknown>) => boolean
   /** audioOut.isSpeaking(). Consulted per buffer; false closes the gate. */
   readonly isCoachSpeaking: () => boolean
+  /**
+   * ARMS BARGE-IN. Called once per trigger, and it must be a FULL interrupt: stop what is
+   * playing, drop what is queued, AND discard the remainder of the response the server is
+   * still streaming. `session.ts`'s own `interrupt(reason, force)` does all three; plain
+   * `audio.stop()` does only the first two, and the coach would resume mid-sentence a
+   * moment later as the next deltas arrive.
+   *
+   * OMITTING IT DISABLES BARGE-IN, deliberately. Opening the gate without silencing the
+   * coach is the exact feedback loop the gate exists to prevent — the model would hear
+   * itself and answer its own sentence — so this module refuses to open the gate when it
+   * has no way to stop the voice.
+   *
+   * Called once per trigger, and triggers are rate-limited by `BARGE_IN_TUNING.refractoryMs`
+   * because the shipped hook's side effects (a 6 s discard window, a policy silence marker)
+   * are not idempotent. Normally that means exactly one call per interruption: the coach
+   * falls silent, so there is nothing left to barge into.
+   */
+  readonly interruptCoach?: () => void
+  /** Overridden in tests; defaults to BARGE_IN_TUNING. The master switch lives in there. */
+  readonly bargeInTuning?: BargeInTuning
   /** Reported once per distinct failure, never swallowed. */
   readonly onFailure?: (failure: MicFailure) => void
   readonly onDebug?: (message: string) => void
@@ -174,6 +214,14 @@ export interface MicUplink {
   start(): Promise<void>
   stop(): void
   state(): MicState
+  /**
+   * The barge-in detector's state: tracked noise floor, trigger count, and how many
+   * triggers the echo guard held back. Read-only, for tests and for a human deciding
+   * whether this room needs `BARGE_IN_TUNING.enabled = false`. Deliberately NOT part of
+   * `MicState`, which is a UI contract read by three components and compared field by
+   * field in duckLoop.
+   */
+  bargeIn(): BargeInState
 }
 
 export function createMicUplink(options: MicUplinkOptions): MicUplink {
@@ -183,21 +231,115 @@ export function createMicUplink(options: MicUplinkOptions): MicUplink {
   const unschedule = options.clearInterval ?? ((handle) => clearInterval(handle as never))
   const silence = silenceFrame(AUDIO_IN_CONFIG.bufferSize)
 
+  const tuning = options.bargeInTuning ?? BARGE_IN_TUNING
+  /**
+   * Barge-in is armed only when there is a way to SILENCE the coach. Without the hook,
+   * opening the gate would hand the model its own voice — see `interruptCoach`.
+   */
+  const bargeInArmed = tuning.enabled && typeof options.interruptCoach === 'function'
+  const preRollCap = bargeInArmed ? preRollBuffers(tuning) : 0
+
   let audioIn: AudioIn | null = null
   let failure: MicFailure | null = null
   let lastSentAt = Number.NEGATIVE_INFINITY
   let flushBudget = 0
   let flushTimer: unknown = null
+  let barge: BargeInState = INITIAL_BARGE_IN
+  /**
+   * The last few GATED buffers, oldest first, already base64-encoded. Flushed ahead of the
+   * triggering buffer so the user's first words survive the hold window; bounded by
+   * `preRollCap`, so a long coach utterance cannot grow it.
+   */
+  let preRoll: string[] = []
 
   /**
    * The gate, and the single most important line in two-way voice. False while the
-   * coach is audible, so the model cannot hear itself through the speakers.
+   * coach is audible, so the model cannot hear itself through the speakers — except
+   * inside a barge-in window, which is the user's own interruption being let through.
    */
   function gateOpen(): boolean {
-    return !options.isCoachSpeaking()
+    if (!options.isCoachSpeaking()) return true
+    return bargeInArmed && gateHeldOpen(barge, now())
+  }
+
+  /**
+   * Every buffer audioIn captures, gated or not. Three jobs, in this order: feed the
+   * detector, act on a trigger, and otherwise keep the pre-roll fresh.
+   *
+   * The trigger path deliberately does NOT push the current buffer into the pre-roll —
+   * audioIn re-consults the gate straight after this returns and sends it through
+   * `onChunk`, so storing it here would transmit the same 85 ms twice.
+   */
+  function onBuffer(buffer: AudioInBuffer): void {
+    if (!bargeInArmed) return
+    const at = now()
+    const outcome = observeLevel(barge, { level: buffer.level, coachSpeaking: options.isCoachSpeaking(), at }, tuning)
+    barge = outcome.state
+
+    if (outcome.trigger) {
+      fireBargeIn(buffer.level, at)
+      return
+    }
+    if (outcome.reason === 'suspected-echo') {
+      options.onDebug?.(
+        `suspected echo, not barge-in: level ${buffer.level.toFixed(4)} inside the ` +
+          `${tuning.echoGuardMs}ms guard (bar ${triggerLevel(barge, at, tuning).toFixed(4)})`,
+      )
+    }
+    rememberPreRoll(buffer)
+  }
+
+  /** Stop the coach, hold the gate open, and replay what the user already said. */
+  function fireBargeIn(level: number, at: number): void {
+    options.onDebug?.(
+      `barge-in: level ${level.toFixed(4)} held ${tuning.holdMs}ms over ` +
+        `${triggerLevel(barge, at, tuning).toFixed(4)} (floor ${barge.noiseFloor.toFixed(4)})`,
+    )
+    try {
+      options.interruptCoach?.()
+    } catch (cause) {
+      // Never swallowed, and never fatal: the gate is already held open, so the user is
+      // being heard even if the coach could not be silenced. The room will sound bad; a
+      // thrown error here would additionally cost the microphone.
+      options.onFailure?.({
+        code: 'mic_failed',
+        message: `barge-in could not stop the coach: ${describe(cause)}`,
+      })
+    }
+    flushPreRoll()
+  }
+
+  /** Bounded ring of gated buffers; anything the gate let through needs no pre-roll. */
+  function rememberPreRoll(buffer: AudioInBuffer): void {
+    if (preRollCap === 0) return
+    if (!buffer.gated) {
+      if (preRoll.length > 0) preRoll = []
+      return
+    }
+    // Sub-floor buffers are the ones audioIn would never transmit anyway; keeping them
+    // would spend the ring on room tone instead of on the user's first syllable.
+    if (buffer.level < AUDIO_IN_CONFIG.silenceFloor) return
+    // Encoded HERE, synchronously: takeBase64() expires when onBuffer returns.
+    const next = preRoll.concat(buffer.takeBase64())
+    preRoll = next.length > preRollCap ? next.slice(next.length - preRollCap) : next
+  }
+
+  function flushPreRoll(): void {
+    const pending = preRoll
+    preRoll = []
+    // In order, oldest first, and through the same accounting as a live buffer so the
+    // silence flush treats the barged-in turn as the live turn it is.
+    for (const frame of pending) sendAudio(frame)
+    if (pending.length > 0) {
+      options.onDebug?.(`replayed ${pending.length} pre-roll buffers so the first words survive`)
+    }
   }
 
   function onChunk(base64Pcm: string): void {
+    sendAudio(base64Pcm)
+  }
+
+  function sendAudio(base64Pcm: string): void {
     if (!isWithinAppendLimit(base64Pcm)) {
       // Not fatal and not silent: dropping one 85 ms buffer costs a syllable, where
       // sending an oversized event costs the whole turn.
@@ -240,6 +382,9 @@ export function createMicUplink(options: MicUplinkOptions): MicUplink {
     const created = makeAudioIn({
       onChunk,
       gateOpen,
+      // Installed only when barge-in is armed, so an un-armed session keeps audioIn on
+      // its original path: gate first, nothing encoded while shut.
+      onBuffer: bargeInArmed ? onBuffer : undefined,
       // A per-buffer failure (a send that threw) is reported but does not stop
       // capture: the next buffer may well work, and stopping would need a gesture
       // to restart.
@@ -250,7 +395,15 @@ export function createMicUplink(options: MicUplinkOptions): MicUplink {
       await created.start()
       failure = null
       if (flushTimer === null) flushTimer = schedule(flushSilence, UPLINK_CONFIG.flushCheckMs)
-      options.onDebug?.(`mic uplink armed at ${AUDIO_IN_CONFIG.sampleRate} Hz`)
+      options.onDebug?.(
+        `mic uplink armed at ${AUDIO_IN_CONFIG.sampleRate} Hz, barge-in ` +
+          (bargeInArmed
+            ? `on (hold ${tuning.holdMs}ms, ${tuning.triggerOverFloor}x room, ` +
+              `pre-roll ${preRollCap} buffers)`
+            : tuning.enabled
+              ? 'OFF: no interruptCoach hook was supplied, so the coach cannot be silenced'
+              : 'OFF by BARGE_IN_TUNING.enabled'),
+      )
     } catch (cause) {
       audioIn = null
       recordFailure(
@@ -266,6 +419,11 @@ export function createMicUplink(options: MicUplinkOptions): MicUplink {
     audioIn = null
     lastSentAt = Number.NEGATIVE_INFINITY
     flushBudget = 0
+    // The room, the hold and any held-open gate all belong to the capture that just ended:
+    // a restart must not inherit a window that would let the first buffer through, nor a
+    // pre-roll recorded minutes ago.
+    barge = INITIAL_BARGE_IN
+    preRoll = []
     if (flushTimer !== null) {
       unschedule(flushTimer)
       flushTimer = null
@@ -284,5 +442,9 @@ export function createMicUplink(options: MicUplinkOptions): MicUplink {
     }
   }
 
-  return { start, stop, state }
+  return { start, stop, state, bargeIn: () => barge }
+}
+
+function describe(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }

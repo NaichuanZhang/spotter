@@ -8,35 +8,34 @@
  * `measureAngles` -> median filter -> `repMachine` chain that `poseEngine.processFrame`
  * runs. See `realMotion.ts` for provenance.
  *
- * ================================ THE HEADLINE ================================
+ * ============================== WHAT THIS FILE IS =============================
  *
- * SPOTTER COUNTS ZERO OF THIS DEMONSTRATOR'S SIX PUSHUPS. That is not a bug in the
- * detector and not a bug in the geometry — both work fine on a horizontal body, which is
- * itself the good news this file exists to prove. It is a CALIBRATION failure, in exactly
- * one threshold:
+ * The INPUT characterisation: does the detector track a horizontal body, is the signal a
+ * pushup, do the recorded numbers still reproduce frame for frame. The REQUIREMENT — that
+ * all six reps are counted and that nothing untrue is said about them — lives next door in
+ * `realMotionReps.test.ts`. Keep the split: this file is allowed to change when the fixture
+ * changes, that one is not allowed to change at all without an argument.
  *
- *   REP_THRESHOLDS.upEnterDeg is 155. The six cycles top out at 121.7, 122.4, 123.6,
- *   126.7, 129.0 and 151.0 smoothed degrees. The machine gets all the way down past
- *   `downEnterDeg` (100) on every one of them and then never comes back up far enough to
- *   score, so it sits in BOTTOM forever.
+ * ============================ WHAT IT USED TO SAY =============================
  *
- * WHAT WOULD HAVE TO CHANGE, and why this test does not change it: `upEnterDeg` would have
- * to drop to about 120 to score all six, which leaves a 20-degree gap over `downEnterDeg`
- * instead of the present 55. `repMachine.ts` says in its own header that "the gap IS the
- * algorithm" — it is what stops landmark noise dithering across one line and inventing
- * reps. Narrowing it is a real trade, on real hardware, against a real noise floor, and it
- * is not a decision a test gets to make by quietly editing a constant until it goes green.
+ * That SPOTTER counted ZERO of this demonstrator's six pushups, and that fixing it was a
+ * calibration decision no test got to make. Both findings were real, both are now fixed,
+ * and this file was rewritten deliberately rather than loosened:
  *
- * So the expectation below is the measured truth (zero), written down loudly. When the
- * thresholds are recalibrated this test WILL fail, and the failure is the point: it forces
- * whoever recalibrates to look at what the new numbers do to real motion.
+ *   1. `upEnterDeg` was 155 against rep tops of 121.7 - 151.0 smoothed degrees, so the
+ *      machine descended past `downEnterDeg` six times and never closed a rep. It is now
+ *      115, the failure to lock out is coached through `no_lockout` instead of silently
+ *      withholding the rep, and the hysteresis gap it cost (55 -> 15 degrees) is floored by
+ *      `REP_THRESHOLDS.minHysteresisGapDeg`. The argument and the numbers behind 115 are in
+ *      `repMachine.ts`; the evidence that it works is in `realMotionReps.test.ts`.
+ *   2. `measureAngles` returned a `hipDeviation` on all 578 frames although only 45 have a
+ *      visible ankle, by extrapolating the shoulder->ankle line to a foot the detector
+ *      placed off frame. The last test here used to pin that hazard and now pins its
+ *      REFUSAL, which is what its own comment demanded should happen.
  *
- * SECOND FINDING, smaller but sharper: the source is a portrait crop that cuts the feet
- * off. Only 45 of 578 frames satisfy `requiredLandmarks`, yet `measureAngles` returns a
- * `hipDeviation` on all 578, because `hipDeviation` gates on finiteness and body span but
- * never on ankle VISIBILITY. It happily extrapolates a line to an ankle the detector
- * invented off-frame. The last test here pins that, because it is the mechanism by which
- * this clip produces a 68-degree "pike" that no human spine could make.
+ * The scale of hazard 2, for the record: the fabricated deviations reached 69.5 degrees of
+ * "pike", while on the 45 frames where the ankle is genuinely visible the deviation spans
+ * -11.95 to -4.13 degrees. The invented number was nearly six times the largest real one.
  */
 
 import { describe, expect, it } from 'vitest'
@@ -123,39 +122,51 @@ describe('real motion: the detector on a horizontal body', () => {
 
       // Deep enough to open a rep...
       expect(measured.min).toBeLessThan(REP_THRESHOLDS.downEnterDeg)
-      // ...and never straight enough to close one, by either measurement. The finding.
-      expect(measured.max).toBeLessThan(REP_THRESHOLDS.upEnterDeg)
-      expect(cycle.maxElbowAngle).toBeLessThan(REP_THRESHOLDS.upEnterDeg)
+      // ...and straight enough at the top to close one, now that the lockout is a quality
+      // flag rather than a gate. `meetsAppLockout` is the extraction's record of the OLD
+      // threshold, and it is false on every cycle — that is what used to score zero.
+      expect(measured.max).toBeGreaterThan(REP_THRESHOLDS.upEnterDeg)
+      expect(cycle.maxElbowAngle).toBeGreaterThan(REP_THRESHOLDS.upEnterDeg)
       expect(cycle.meetsAppLockout).toBe(false)
     }
   })
 
-  it('scores exactly what the extraction said SPOTTER would score: none of them', () => {
+  /**
+   * UPDATED DELIBERATELY. This test used to assert zero reps and to cite
+   * `repDetection.appThresholds.repsScored` (also zero) as corroboration. Both numbers were
+   * measurements of the pre-recalibration thresholds, so the JSON field is now history and
+   * the live count belongs to `realMotionReps.test.ts`. What is still worth pinning HERE is
+   * the thing the fixture is for: the spliced stream ends at the top of a rep with the
+   * machine idle, not stuck in BOTTOM, which is how the old failure announced itself.
+   */
+  it('no longer strands the machine in BOTTOM for the whole clip', () => {
     const run = runPipeline(fixture.frames, { view: 'side' })
 
-    expect(run.reps.totalReps).toBe(fixture.repsScoredByAppThresholds)
-    expect(run.reps.totalReps).toBe(MEASURED.repsScored)
-    expect(run.reps.cleanReps).toBe(0)
-    expect(eventsOfKind(run.events, 'rep_completed')).toHaveLength(0)
-
-    // Stuck in BOTTOM, not idling at the top: the descent was seen, the ascent never
-    // cleared `upEnterDeg`. A `top` here would mean something else was wrong.
+    expect(run.reps.totalReps).toBeGreaterThan(0)
     expect(run.reps.armed).toBe(true)
-    expect(run.reps.phase).toBe('bottom')
-    expect(run.reps.current).not.toBeNull()
+    expect(eventsOfKind(run.events, 'rep_completed')).toHaveLength(run.reps.totalReps)
+    // The old reading: descents seen, no ascent ever cleared `upEnterDeg`, so `current`
+    // stayed open forever and every rep was swallowed.
+    expect(fixture.repsScoredByAppThresholds).toBe(MEASURED.repsScoredByOldLockoutDeg.repsScored)
   })
 
-  it('pins the one threshold that is wrong, and by how much', () => {
+  it('pins the band the threshold was calibrated against, and the margin either side', () => {
     const tops = fixture.cycles.map((cycle) => Math.max(...elbowsIn(cycle.startFrame, cycle.endFrame)))
     const best = Math.max(...tops)
+    const worst = Math.min(...tops)
 
     expect(best).toBeCloseTo(MEASURED.highestCycleTopDeg, 0)
-    // The best lockout in the whole clip still misses by a few degrees...
-    expect(best).toBeLessThan(REP_THRESHOLDS.upEnterDeg)
-    // ...and the WORST cycle is the one that sets the bar: scoring all six needs an
-    // `upEnterDeg` below this, which would narrow the hysteresis gap to ~20 degrees.
-    expect(Math.min(...tops)).toBeGreaterThanOrEqual(fixture.relaxedUpEnterDeg)
-    expect(fixture.relaxedUpEnterDeg).toBeLessThan(REP_THRESHOLDS.upEnterDeg)
+    expect(worst).toBeCloseTo(MEASURED.lowestCycleTopDeg, 0)
+
+    // The worst cycle sets the bar, and the shipped threshold clears it with room to spare
+    // — that margin is what fatigue is allowed to eat before reps stop counting.
+    expect(REP_THRESHOLDS.upEnterDeg).toBeLessThan(worst)
+    // The old threshold did not clear even the best cycle. Hence zero.
+    expect(MEASURED.repsScoredByOldLockoutDeg.upEnterDeg).toBeGreaterThan(best)
+    // The extraction's exploratory 120 also worked; 115 is the shipped, more conservative
+    // choice. If a future recalibration puts `upEnterDeg` above the relaxed pass's value,
+    // the fixture's six reps stop being reproducible and this is where it shows up.
+    expect(REP_THRESHOLDS.upEnterDeg).toBeLessThanOrEqual(fixture.relaxedUpEnterDeg)
   })
 
   it('replays the chosen exemplar rep and reproduces its recorded depth', () => {
@@ -169,28 +180,49 @@ describe('real motion: the detector on a horizontal body', () => {
   })
 
   /**
-   * CHARACTERISATION, NOT APPROVAL. This documents a hazard rather than blessing it: if
-   * `hipDeviation` ever learns to refuse an invisible ankle, this test fails and should be
-   * rewritten to assert the refusal. Do not "fix" it by loosening the expectation.
+   * THE REFUSAL. This test is the rewrite the old characterisation test asked for: it used
+   * to pin `measureAngles` returning a hip deviation on all 578 frames although only 45 have
+   * a visible ankle, and to say that if the refusal was ever implemented the test should
+   * assert it instead. It was, so it does.
+   *
+   * Do not relax this into "usually refuses". The failure mode it guards is a coach that
+   * confidently criticises a back it cannot see.
    */
-  it('still reports a hip deviation from an ankle it cannot see (known hazard)', () => {
+  it('refuses a hip deviation on every frame whose ankle it cannot see', () => {
     const framed = fixture.frames.filter((frame) => inFrame(frame.landmarks).inFrame)
     expect(framed).toHaveLength(MEASURED.inFrameFrames)
 
-    const ankleVisible = fixture.frames.filter(
-      (frame) =>
-        frame.landmarks !== null &&
-        Math.max(visibilityOf(frame.landmarks, LEFT_ANKLE), visibilityOf(frame.landmarks, RIGHT_ANKLE)) >=
-          VISIBILITY.joint,
-    )
-    expect(ankleVisible.length).toBeLessThan(fixture.frames.length / 2)
+    const ankleVisible = (frame: (typeof fixture.frames)[number]): boolean =>
+      frame.landmarks !== null &&
+      Math.max(visibilityOf(frame.landmarks, LEFT_ANKLE), visibilityOf(frame.landmarks, RIGHT_ANKLE)) >=
+        VISIBILITY.joint
+    expect(fixture.frames.filter(ankleVisible).length).toBeLessThan(fixture.frames.length / 2)
 
-    // Yet a hip deviation comes back on frames whose ankle is a guess, and it is not small.
-    const deviations = fixture.frames
-      .map((frame) => measureAngles(frame.landmarks))
-      .filter((angles): angles is NonNullable<typeof angles> => angles !== null)
-      .map((angles) => Math.abs(angles.hipDeviation))
-    expect(deviations).toHaveLength(MEASURED.frameCount)
-    expect(Math.max(...deviations)).toBeGreaterThan(REP_THRESHOLDS.cleanHipDeviationDeg)
+    // Every frame still measures an elbow — losing the feet costs the body line and nothing
+    // else. And the body line comes back EXACTLY on the frames that have an ankle.
+    let measuredBodyLines = 0
+    for (const frame of fixture.frames) {
+      const angles = measureAngles(frame.landmarks)
+      expect(angles).not.toBeNull()
+      expect(Number.isFinite(angles!.elbow)).toBe(true)
+
+      if (ankleVisible(frame)) {
+        expect(angles!.hipDeviation).not.toBeNull()
+        expect(angles!.bodyLine).not.toBeNull()
+        measuredBodyLines += 1
+      } else {
+        expect(angles!.hipDeviation).toBeNull()
+        expect(angles!.bodyLine).toBeNull()
+      }
+    }
+    expect(measuredBodyLines).toBe(MEASURED.bodyLineFrames)
+
+    // What the honest measurement looks like when it IS available: a mild pike, nowhere near
+    // the 69.5-degree "pike" the extrapolated ankle used to invent.
+    const real = fixture.frames
+      .map((frame) => measureAngles(frame.landmarks)?.hipDeviation ?? null)
+      .filter((deviation): deviation is number => deviation !== null)
+    expect(real).toHaveLength(MEASURED.bodyLineFrames)
+    expect(Math.max(...real.map(Math.abs))).toBeLessThan(2 * REP_THRESHOLDS.cleanHipDeviationDeg)
   })
 })

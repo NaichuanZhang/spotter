@@ -155,11 +155,18 @@ export default function AvatarStage({ persona, audible, onSoundRequest, onSoundR
     })
     if (!element) return
 
-    element.muted = !audible
-    element.loop = !audible
-    if (audible) element.currentTime = 0
+    // Sound belongs to the SELECTED coach, not to whatever happens to be painted.
+    // Clicking a card flips `audible` one commit BEFORE the new layer is promoted, so
+    // keying this on `shown` alone unmutes the coach the user just LEFT and plays its
+    // opening out loud for a frame. While that gap is open the painted layer keeps
+    // looping silently; the audible clip starts when it is the one actually on screen.
+    const speaking = audible && shown === persona
+
+    element.muted = !speaking
+    element.loop = !speaking
+    if (speaking) element.currentTime = 0
     void element.play().catch((error: unknown) => {
-      if (!audible) {
+      if (!speaking) {
         // A refused MUTED autoplay is survivable — the panel holds a poster frame.
         console.warn('[spotter] intro autoplay refused', error)
         return
@@ -175,7 +182,7 @@ export default function AvatarStage({ persona, audible, onSoundRequest, onSoundR
         setFailed(true)
       })
     })
-  }, [shown, audible, failed, onSoundRefused])
+  }, [shown, persona, audible, failed, onSoundRefused])
 
   useEffect(() => {
     let frame = 0

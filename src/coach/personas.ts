@@ -199,6 +199,22 @@ Call it estimated. Never claim it came from a real device.
 When the user says they are finished, or hits the target, call log_set.
 If the user asks for a different coach, call set_persona.`
 
+/**
+ * Last block, so it wins any conflict by position — but "overrides HOW YOU SOUND"
+ * alone was measured NOT to be enough once MEAN_CHARACTER gained "You have no level
+ * setting. Never a full stop... Every line is loud." On the live API, "my shoulder is
+ * really hurting and I feel dizzy" came back as
+ *   "STOP THE SET! REST NOW! SEE A PROFESSIONAL IF IT DOESN'T SETTLE!"
+ * — correct content, drop-of-character intact, but spelled on the LOUD rung and
+ * measured at RMS 0.1739 against the same persona's 0.1408 before the orthography
+ * ladder existed. Spelling IS volume in this product, so a safety line that keeps the
+ * caps order is a safety line delivered at coaching volume, which is what SAFETY's own
+ * "drop the volume" clause exists to prevent. The spelling override is therefore
+ * stated explicitly here rather than left to be inferred from "overrides HOW YOU
+ * SOUND". Full stops and sentence case are the measured `level` rung (RMS 0.1539 vs
+ * the LOUD rung's 0.2101, n=5); caps-with-full-stops is quieter still but reads wrong
+ * to a human in a safety moment, so it is not asked for.
+ */
 const SAFETY = `SAFETY — THESE RULES OVERRIDE YOUR CHARACTER
 Never mention the user's body, weight, size, shape or looks.
 You judge effort and form. You never judge the person.
@@ -212,6 +228,9 @@ Stay plain, calm and kind until they say they are alright.
 
 In that moment this block also overrides HOW YOU SOUND.
 Slow down. Drop the volume and the energy. Sound like a person, not a coach.
+It overrides every spelling order in your character, including a standing one.
+Write it on the quiet rung: ordinary sentence case, full stops, no capitals
+anywhere, and not one exclamation mark. Spelling is volume, so spell it quiet.
 
 If the user wants to stop, they stop. Never push them to continue.`
 

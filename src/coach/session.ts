@@ -1,7 +1,7 @@
 /**
  * The coach session: policy on top of the raw protocol in higgsSocket.ts.
  *
- * Owns six things that are each a demo-killer if missed:
+ * Owns seven things that are each a demo-killer if missed:
  *   1. Persona hot-swap — session.update with new instructions + voice, no reconnect.
  *   2. A 4-minute heartbeat — the session closes after 5 minutes without user
  *      *speech*, and a set of pushups is grunting, not talking.
@@ -9,20 +9,23 @@
  *   4. The tool loop, including the mandatory response.create after every reply.
  *   5. The MIC UPLINK, i.e. the half of the conversation that used to be missing.
  *   6. Music ducking, whose two reasons live on either side of that uplink.
+ *   7. WHETHER TO SPEAK AT ALL — see speechPolicy.ts. This file is the only path from a
+ *      CoachEvent to a sentence, which is what makes it the right place to decide, and
+ *      the only place that can see `audio.queuedSec()` and the server's VAD edges.
  *
  * Also owns barge-in. Pose events are time-critical: a bark about rep 3 arriving
  * during rep 7 is worse than a clipped sentence, so a new event cuts audio that is
  * still streaming or badly backlogged — but lets a finished short line play out.
+ * Since the speech policy landed, a routine callout is held rather than pushed while
+ * the coach is audible, so barge-in fires almost only for the severe faults it was
+ * really for.
  *
- * ── THE UPLINK, AND WHY IT TAPS THE SOCKET FACTORY ──────────────────────────
- * `input_audio_buffer.append` has to go out on the SAME socket the connection uses,
- * and HiggsConnection deliberately exposes only the policy frames it knows about —
- * there is no raw send. Rather than fork the transport (which would duplicate its
- * dedupe, ack and close state), this file wraps the `createSocket` seam OpenOptions
- * already provides for tests, and keeps the resulting WebSocket beside `conn`. The
- * socket is only promoted to `liveSocket` once openHiggsSocket RESOLVES: a failed
- * attempt builds a socket too, and appending audio to that one is shouting into a
- * corpse while the real session is elsewhere.
+ * The two-way half is composed from three modules rather than inlined here, because
+ * each one is a mechanism with its own reasoning to document:
+ *   socketTap.ts  — the raw-frame escape hatch, and why a socket is only usable after
+ *                   openHiggsSocket RESOLVES rather than after it is constructed.
+ *   micUplink.ts  — append-only framing, the gate, and the measured silence flush.
+ *   duckLoop.ts   — the 100 ms poll that keeps the two duck reasons honest.
  */
 
 import { toEventLine } from '../types/events'
@@ -31,10 +34,11 @@ import type { PersonaId, ToolRegistry, ToolResult } from '../types/tools'
 import { createAudioOut } from './audioOut'
 import type { AudioOut } from './audioOut'
 import type { AudioIn, AudioInOptions } from './audioIn'
-import { createMicUplink, MIC_OFF } from './micUplink'
+import { createMicUplink } from './micUplink'
 import type { MicState, MicUplink } from './micUplink'
-import { duckReasonsFor, NO_DUCK, syncDuck } from './musicControl'
-import type { DuckReasons, MusicDucker } from './musicControl'
+import { createDuckLoop } from './duckLoop'
+import type { MusicDucker } from './musicControl'
+import { createSocketTap } from './socketTap'
 import {
   classifyClose,
   clampSpeed,
@@ -52,6 +56,15 @@ import type {
 } from './higgsSocket'
 import { DEFAULT_PERSONA_ID, getPersona, isPersonaId } from './personas'
 import type { Persona } from './personas'
+import {
+  createSpeechPolicyState,
+  decideSpeech,
+  noteSilenceStart,
+  noteUserSpeech,
+  noteUserTurn,
+  observeSpeech,
+} from './speechPolicy'
+import type { SpeechPolicyState } from './speechPolicy'
 
 export const COACH_TIMING = {
   /** Push a keepalive if nothing else has been pushed for this long. */
@@ -70,14 +83,6 @@ export const COACH_TIMING = {
   bargeInBacklogSec: 1.2,
   /** Failsafe: stop discarding even if response.done never arrives. */
   discardWindowMs: 6_000,
-  /**
-   * How often the duck reasons are recomputed. Polled rather than evented because
-   * neither input is an event: `audioOut.isSpeaking()` is derived from how much audio
-   * is still scheduled ahead of the clock, and response.done fires while seconds of it
-   * are still queued. 100 ms is comfortably inside musicPlayer's 180 ms duck ramp, so
-   * the level is already moving before the first syllable lands.
-   */
-  duckTickMs: 100,
 } as const
 
 /**
@@ -145,6 +150,21 @@ export const VOICE_RETRY = { attempts: 3, delayMs: 2_000 } as const
 /** Innocuous, prefixed like every other pushed line so it cannot be read aloud. */
 export const HEARTBEAT_LINE = '[EVENT] keepalive — no reply needed'
 
+/**
+ * The server's own voice-activity edges for the USER, which is how the listen window knows
+ * somebody is talking into it.
+ *
+ * They arrive through `onServerEvent` rather than a typed callback because higgsSocket does
+ * not model them — its `default` branch forwards every frame type it does not handle, which
+ * is exactly the escape hatch this needs. Verified live (liveTwoWay.test.ts): server VAD
+ * owns the turn, sends `speech_started` ~415ms in, `speech_stopped` at the end, and commits
+ * the buffer itself.
+ */
+export const USER_SPEECH_EVENTS = {
+  started: 'input_audio_buffer.speech_started',
+  stopped: 'input_audio_buffer.speech_stopped',
+} as const
+
 export type CoachStatus = 'idle' | 'connecting' | 'live' | 'reconnecting' | 'closed' | 'error'
 
 export interface CoachCaption {
@@ -188,6 +208,17 @@ export interface CoachSessionOptions {
   createAudioIn?: (options: AudioInOptions) => AudioIn
   /** Fired when the mic's reported state changes materially (armed, gated, failed). */
   onMicState?: (state: MicState) => void
+  /**
+   * The speech policy's clock. MUST share the monotonic timeline `CoachEvent.at` is stamped
+   * from, which in a browser is `performance.now()` for both — the pose engine and this
+   * session run in one document, so there is one origin. Overridden only by tests, which
+   * cannot wait real seconds for a listen window to expire.
+   *
+   * Deliberately NOT `Date.now`: a clock adjustment mid-set would make the coach either
+   * mute or non-stop, and this repo has already paid for mixing those two domains once
+   * (heart rate reported a resting pulse for an entire set).
+   */
+  now?: () => number
 }
 
 export interface CoachSession {
@@ -222,6 +253,7 @@ type Timer = ReturnType<typeof setTimeout>
 export function createCoachSession(options: CoachSessionOptions = {}): CoachSession {
   const audio = options.audio ?? createAudioOut({ onWarn: (m) => debug(`audio: ${m}`) })
   const voiceOverrides = new Map<PersonaId, string>()
+  const now = options.now ?? (() => performance.now())
 
   let personaId: PersonaId = options.persona ?? DEFAULT_PERSONA_ID
   let registry: ToolRegistry | null = options.registry ?? null
@@ -235,18 +267,22 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
   let sentSpeed = 0
   let captionBuffer = ''
   let discardUntil = 0
+  /**
+   * Everything the coach is allowed to say passes through this. Threaded, never mutated,
+   * and deliberately NOT reset on a reconnect: the set is still the same set, and a fresh
+   * policy would restart the "speak on the first rep" rhythm halfway through one.
+   */
+  let policy: SpeechPolicyState = createSpeechPolicyState()
   let handlingToolCall = false
   let heartbeatTimer: Timer | null = null
   let reconnectTimer: Timer | null = null
-  let duckTimer: Timer | null = null
   /** Bumped per open attempt, so a socket we gave up on cannot close the one that replaced it. */
   let generation = 0
-  /** The socket behind `conn`, kept only so mic frames can be appended to it. */
-  let liveSocket: WebSocket | null = null
-  /** Built by the createSocket tap; promoted to liveSocket only on a successful open. */
-  let pendingSocket: WebSocket | null = null
-  let duckReasons: DuckReasons = NO_DUCK
-  let lastMicState: MicState = MIC_OFF
+  /**
+   * How many open attempts are in flight. Nonzero means the connect path owns whatever
+   * the sockets it built are doing — see handleClose for the double-session this stops.
+   */
+  let openAttempts = 0
 
   function debug(message: string, detail?: unknown): void {
     options.onDebug?.(message, detail)
@@ -265,50 +301,22 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
   // ------------------------------------------------------------ uplink + ducking
 
   /**
-   * Wraps the caller's socket factory so the raw WebSocket stays reachable. The
-   * default branch is the same `new WebSocket(url, protocols)` higgsSocket would have
-   * used, so injecting a tap changes nothing about how the socket is opened.
+   * The raw-frame escape hatch for `input_audio_buffer.append`. See socketTap.ts for
+   * why HiggsConnection cannot carry it and why a socket only counts once it is live.
+   * Mic frames deliberately do NOT touch `lastPushAt`: that timestamp guards the
+   * 4-minute keepalive against the server's 5-minute no-speech close, and a mic buffer
+   * is not proof of speech — a quiet room still produces buffers above the silence
+   * floor. If the user really is talking, the server's own idle timer is reset by the
+   * audio itself, and the extra keepalive is harmless either way.
    */
-  function socketOptions(): OpenOptions {
-    const base = options.socket ?? {}
-    const create =
-      base.createSocket ?? ((url: string, protocols: string[]) => new WebSocket(url, protocols))
-    return {
-      ...base,
-      createSocket: (url, protocols) => {
-        const socket = create(url, protocols)
-        pendingSocket = socket
-        return socket
-      },
-    }
-  }
-
-  /**
-   * One `input_audio_buffer.append`, and NOTHING else — no input_audio_buffer.commit
-   * and no response.create. turn_detection is server_vad, so the server decides where
-   * the user's turn ended; committing would cut them off mid-sentence and a
-   * response.create would have the coach answer a turn twice.
-   *
-   * Deliberately does NOT touch `lastPushAt`. That timestamp guards the 4-minute
-   * keepalive against the server's 5-minute no-speech close, and mic buffers are not
-   * proof of speech — a quiet room still produces buffers above the silence floor. If
-   * the user really is talking, the server's own idle timer is reset by the audio, and
-   * the extra keepalive is harmless either way.
-   */
-  function sendMicFrame(frame: Record<string, unknown>): boolean {
-    const socket = liveSocket
-    if (!conn?.isOpen() || !socket || socket.readyState !== WebSocket.OPEN) return false
-    try {
-      socket.send(JSON.stringify(frame))
-      return true
-    } catch (cause) {
-      report(new CoachError('audio', 'could not send a microphone buffer', cause))
-      return false
-    }
-  }
+  const tap = createSocketTap({
+    base: options.socket,
+    isConnected: () => conn?.isOpen() ?? false,
+    onError: report,
+  })
 
   const mic: MicUplink = createMicUplink({
-    send: sendMicFrame,
+    send: tap.send,
     /**
      * THE GATE. audioOut owns "is the coach speaking"; asking it per buffer rather
      * than keeping a copy here is what stops the two drifting apart — and a drifted
@@ -316,58 +324,55 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
      * model answers its own last sentence on stage.
      */
     isCoachSpeaking: () => audio.isSpeaking(),
+    /**
+     * WHAT ARMS BARGE-IN AT ALL. `createMicUplink` computes
+     * `tuning.enabled && typeof interruptCoach === 'function'`, so omitting this option
+     * leaves the whole of bargeIn.ts inert: `audioIn` gets no `onBuffer` monitor, the level
+     * of the gated buffers is never measured, and the gate can never open on a talking
+     * coach. That is deliberate on the uplink's side — opening the gate without silencing
+     * the coach hands the model its own voice — but it means this line IS the feature.
+     *
+     * `force: true` is required, not defensive. Unforced, `interrupt` returns early unless
+     * `isResponding()` or the queue is past `bargeInBacklogSec`, and barge-in's whole case
+     * is a coach mid-utterance from audio ALREADY queued locally — exactly when both of
+     * those are false.
+     *
+     * `interrupt` and not `audio.stop()`: only the former also clears the caption, restarts
+     * the listen window via `noteSilenceStart`, and sets `discardUntil` so the remainder of
+     * the response the server is STILL STREAMING is thrown away. With only a stop, the
+     * coach resumes mid-sentence a moment later as the next deltas land.
+     */
+    interruptCoach: () => interrupt('user barged in', true),
+    /**
+     * One clock for the whole session. Without this the uplink falls back to `Date.now()`
+     * while everything else here runs on `performance.now()` — the same mixing of domains
+     * that once made heart rate report a resting pulse for an entire set. Barge-in's hold
+     * and refractory windows are all deltas, so they stay self-consistent either way, but
+     * `Date.now()` is not monotonic and an NTP or DST step mid-set would corrupt them.
+     */
+    now,
     onFailure: (failure) => {
       // Surfaced, never swallowed — and never fatal. The pose-driven one-way coaching
       // is the product; two-way is additive, so a denied mic degrades and carries on.
       report(new CoachError('audio', `microphone unavailable (${failure.code}): ${failure.message}`))
-      publishMicState()
+      duck.publish()
     },
     onDebug: debug,
     createAudioIn: options.createAudioIn,
   })
 
-  function publishMicState(): void {
-    const next = mic.state()
-    if (sameMicState(lastMicState, next)) return
-    lastMicState = next
-    options.onMicState?.(next)
-  }
-
-  /**
-   * Recomputes BOTH duck reasons every tick and applies only the transitions. Both
-   * edges, always: 'coach' and 'mic' overlap constantly, and a caller that sets one
-   * and forgets to clear it leaves the music quiet for the rest of the demo.
-   */
-  function tickDuck(): void {
-    publishMicState()
-    const ducker = options.music
-    if (!ducker) return
-    duckReasons = syncDuck(
-      ducker,
-      duckReasons,
-      duckReasonsFor({ coachSpeaking: audio.isSpeaking(), micArmed: lastMicState.armed }),
-    )
-  }
-
-  function startDuckTick(): void {
-    if (duckTimer !== null) return
-    duckTimer = setInterval(tickDuck, COACH_TIMING.duckTickMs)
-  }
-
-  function stopDuckTick(): void {
-    if (duckTimer === null) return
-    clearInterval(duckTimer)
-    duckTimer = null
-    // Release both reasons on the way out. A track can outlive the socket, and with
-    // the tick stopped there would be nothing left running to restore its level.
-    if (options.music) duckReasons = syncDuck(options.music, duckReasons, NO_DUCK)
-  }
+  const duck = createDuckLoop({
+    isCoachSpeaking: () => audio.isSpeaking(),
+    getMicState: () => mic.state(),
+    music: options.music,
+    onMicState: options.onMicState,
+  })
 
   /** Never rejects: the uplink converts a refused mic into state, not an exception. */
   async function startMic(): Promise<void> {
     if (options.micEnabled === false) return
     await mic.start()
-    publishMicState()
+    duck.publish()
   }
 
   // ------------------------------------------------------------------ receiving
@@ -389,7 +394,17 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
       captionBuffer = ''
       if (!shouldDiscard()) emitCaption(text, true)
     },
-    onAudioDone: () => debug('utterance finished'),
+    /**
+     * THE LISTEN WINDOW'S ANCHOR. The server has finished SENDING the utterance, so every
+     * sample of it is now scheduled in audioOut and `queuedSec()` is exactly how much is
+     * still to be heard. That makes this the one moment the drain time can be known
+     * precisely — which is the whole reason the window is not measured from the push or
+     * from response.done, both of which land while seconds of audio are still queued.
+     */
+    onAudioDone: () => {
+      policy = observeSpeech(policy, now(), audio.queuedSec())
+      debug('utterance finished')
+    },
     // Either boundary ends the discard window. Clearing on the NEXT response too
     // means a barge-in can never swallow the opening word of the new bark, which
     // is the worse of the two failure modes.
@@ -401,11 +416,25 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
       // Emphasis is per-utterance. Leaving it hot would make every later line
       // loud, which destroys the contrast that made the severe line land.
       audio.setEmphasis(false)
+      // Belt and braces for the window: if output_audio.done never arrives, this still
+      // sees the queue. It is NOT sufficient on its own — measured, this fires with
+      // 0.3-2.5s of audio still scheduled, which is the bug the anchor above exists for.
+      policy = observeSpeech(policy, now(), audio.queuedSec())
     },
     onToolCall: handleToolCall,
     onError: report,
     onClose: handleClose,
-    onServerEvent: (type, payload) => debug(`unhandled server event: ${type}`, payload),
+    onServerEvent: (type, payload) => {
+      // The user talking is the one thing the listen window is being held open FOR, so
+      // these two frames are worth more than a debug line.
+      if (type === USER_SPEECH_EVENTS.started || type === USER_SPEECH_EVENTS.stopped) {
+        const speaking = type === USER_SPEECH_EVENTS.started
+        policy = noteUserSpeech(policy, now(), speaking)
+        debug(speaking ? 'user started speaking' : 'user stopped speaking')
+        return
+      }
+      debug(`unhandled server event: ${type}`, payload)
+    },
   }
 
   /**
@@ -440,6 +469,10 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
     if (!force && !responding && !backlogged) return
     audio.stop()
     captionBuffer = ''
+    // The queue this was measuring is gone, so the silence starts NOW. Leaving the old
+    // drain time in the future would hold the listen window closed for the length of an
+    // utterance nobody ever heard.
+    policy = noteSilenceStart(policy, now())
     if (responding) discardUntil = Date.now() + COACH_TIMING.discardWindowMs
     debug(`barge-in: ${reason}`)
   }
@@ -518,12 +551,37 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
     debug(`pace -> ${next.toFixed(3)}`)
   }
 
+  /**
+   * THE CHOKE POINT. Every event still arrives here — the HUD, the counter and the
+   * heart-rate model are fed upstream by the engine's own listeners and are untouched by
+   * this — and the policy decides which of them becomes a sentence.
+   *
+   * The socket check stays FIRST so the policy only ever judges events it could actually
+   * have spoken: an event dropped because there is no socket must not count as a rep the
+   * coach "chose" to stay quiet for, or the digest would later claim to have watched reps
+   * during a reconnect.
+   */
   function pushEvent(event: CoachEvent): void {
-    const line = toEventLine(event)
     if (!conn?.isOpen()) {
-      debug(`dropped (socket not open): ${line}`)
+      debug(`dropped (socket not open): ${toEventLine(event)}`)
       return
     }
+    const decision = decideSpeech(policy, {
+      event,
+      t: now(),
+      // Read-only. audioOut owns the queue; asking it per decision rather than keeping a
+      // copy here is what stops the two drifting apart, the same rule the mic gate follows.
+      queuedSec: audio.queuedSec(),
+      target: options.getWorkoutState?.()?.target ?? null,
+    })
+    policy = decision.state
+    if (decision.line === null) {
+      // Logged, never swallowed: "the coach said nothing" has to be explainable, or the
+      // next person to tune this cannot tell a policy decision from a broken socket.
+      debug(`${decision.reason}: ${toEventLine(event)}`)
+      return
+    }
+    const line = decision.line
     if (options.interruptOnEvent !== false) interrupt(line)
     // Both of these MUST precede conversation.item.create / response.create: a
     // session patch applies to the NEXT generated response and never retroactively
@@ -547,6 +605,15 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
       return
     }
     interrupt('user spoke', true)
+    /**
+     * A typed turn claims the bucket exactly as a spoken one does. Without this the
+     * coach's ANSWER is the only utterance in the system nothing is accounted for: the
+     * gate still holds `lastUtteranceAt` from whatever spoke before, so the next rep —
+     * which is routine, and arrives inside 2.5s — can push straight into the reply and
+     * trample it. The spoken path gets this from `noteUserSpeech` on the server's VAD
+     * `speech_stopped`; a typed turn has no VAD edge, so it has to be recorded here.
+     */
+    policy = noteUserTurn(policy, now())
     conn.pushUserText(trimmed)
     lastPushAt = Date.now()
   }
@@ -610,6 +677,17 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
   // The explicit `number` is load-bearing: VOICE_RETRY is `as const`, so an
   // inferred default would narrow the parameter to the literal 3.
   async function openOnce(voiceRetriesLeft: number = VOICE_RETRY.attempts): Promise<void> {
+    // Counted, not a boolean: the voice retry recurses, and the whole chain has to keep
+    // owning its sockets' closes until the last one has resolved or given up.
+    openAttempts += 1
+    try {
+      await openAttempt(voiceRetriesLeft)
+    } finally {
+      openAttempts -= 1
+    }
+  }
+
+  async function openAttempt(voiceRetriesLeft: number): Promise<void> {
     const persona = getPersona(personaId)
     const voice = voiceFor(persona)
     generation += 1
@@ -618,10 +696,10 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
       conn = await openHiggsSocket(
         { instructions: persona.instructions, voice, speed: persona.speed },
         { ...callbacks, onClose: closeCallbackFor(attempt) },
-        socketOptions(),
+        tap.options(),
       )
     } catch (cause) {
-      pendingSocket = null
+      tap.release()
       const error = asCoachError(cause)
       // Order matters: a 429 must be caught BEFORE the fallback check, or a
       // transient rate limit spends the fallback and the persona loses its voice
@@ -642,8 +720,7 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
       throw error
     }
     // Only now is the socket the one we are actually talking on.
-    liveSocket = pendingSocket
-    pendingSocket = null
+    tap.promote()
     attempts = 0
     discardUntil = 0
     captionBuffer = ''
@@ -652,7 +729,7 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
     if (hasConnectedOnce) reseed()
     hasConnectedOnce = true
     startHeartbeat()
-    startDuckTick()
+    duck.start()
     setStatus('live')
     // Fire-and-forget on purpose, and it cannot reject: two-way voice must not gate
     // the session going live, and a mic that never arrives leaves a working one-way
@@ -680,11 +757,31 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
   }
 
   function handleClose(info: { code: number; reason: string; wasClean: boolean }): void {
+    /**
+     * A close that belongs to an open attempt is THAT ATTEMPT'S business, and this is a
+     * measured bug, not a hypothetical. openHiggsSocket closes its own socket when a
+     * pre-ack `error` frame decides the connect (voice validation answering 429 is the
+     * common one), and that close is delivered here BEFORE the rejection reaches the
+     * catch below that owns the retry. `generation` still matches, so it used to read as
+     * an unexpected drop and schedule a reconnect — which then ran IN PARALLEL with the
+     * voice retry. One live probe recorded three session.update frames and two
+     * session.created for a single connect(), i.e. two live sessions against a key the
+     * API limits to one, whose own answer to that is close code 1013.
+     *
+     * Returning before the teardown is deliberate: the failing attempt already released
+     * the tap, and releasing it here could clear the `pending` socket of the attempt
+     * that is replacing it, leaving `promote()` nothing to promote and the mic uplink
+     * appending into a socket nobody is listening on for the rest of the session.
+     */
+    if (openAttempts > 0) {
+      debug(`ignored close ${info.code} from an attempt the connect path still owns`)
+      return
+    }
     conn = null
-    // Dropped here rather than in the tap: sendMicFrame must never append to a socket
-    // that is on its way out. The mic itself keeps capturing, so a reconnect resumes
-    // the uplink without a second permission prompt.
-    liveSocket = null
+    // Released immediately: nothing may append to a socket that is on its way out. The
+    // mic itself keeps capturing, so a reconnect resumes the uplink without a second
+    // permission prompt.
+    tap.release()
     stopHeartbeat()
     audio.stop()
     if (userClosed) {
@@ -772,7 +869,9 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
   function disconnect(): void {
     userClosed = true
     stopHeartbeat()
-    stopDuckTick()
+    // Stops the tick AND releases both duck reasons, so a track that outlives the
+    // socket is not left quiet with nothing running to raise it.
+    duck.stop()
     if (reconnectTimer !== null) {
       clearTimeout(reconnectTimer)
       reconnectTimer = null
@@ -780,12 +879,11 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
     // The mic goes down with the session: an open capture with nowhere to send is a
     // live microphone the user cannot see a reason for.
     mic.stop()
-    publishMicState()
+    duck.publish()
     audio.stop()
     conn?.close()
     conn = null
-    liveSocket = null
-    pendingSocket = null
+    tap.release()
     setStatus('closed')
   }
 
@@ -814,28 +912,6 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
     stopMusic: () => options.music?.stop(),
     audio,
   }
-}
-
-/** Below this the mic level has not moved enough to redraw a three-segment meter. */
-export const MIC_LEVEL_STEP = 0.05
-
-/**
- * Quantised comparison, because `level` moves on every 85 ms buffer and an un-damped
- * onMicState would re-render the HUD at 10 Hz for changes no eye can see.
- */
-export function sameMicState(a: MicState, b: MicState): boolean {
-  return (
-    a.capturing === b.capturing &&
-    a.gated === b.gated &&
-    a.armed === b.armed &&
-    (a.error?.code ?? null) === (b.error?.code ?? null) &&
-    micLevelStep(a.level) === micLevelStep(b.level)
-  )
-}
-
-export function micLevelStep(level: number): number {
-  if (!Number.isFinite(level) || level <= 0) return 0
-  return Math.round(Math.min(1, level) / MIC_LEVEL_STEP)
 }
 
 /** What the fresh session is told after a reconnect, in the usual event shape. */

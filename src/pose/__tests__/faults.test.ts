@@ -13,7 +13,9 @@ import {
   persistenceFor,
   severityFor,
   UTTERANCE_RANK,
+  validateFaultThresholds,
 } from '../faults'
+import { REP_THRESHOLDS } from '../repMachine'
 import type { RepMetrics } from '../../types/events'
 import {
   cleanSet,
@@ -135,6 +137,59 @@ describe('evaluateFaults', () => {
   it('skips nullable angles rather than treating them as zero', () => {
     const noNeck: PoseAngles = { ...straight, neck: null, flare: null }
     expect(evaluateFaults({ angles: noNeck, phase: 'top', view: 'front', inFrame: true })).toEqual([])
+  })
+
+  it('proposes no hip fault at all when the body line was never measured', () => {
+    // Null is NOT zero. Zero would read as a straight back and clear the fault honestly;
+    // null means the hip or ankle was off camera and there is nothing to judge either way.
+    const unseen: PoseAngles = { ...straight, bodyLine: null, hipDeviation: null }
+    const faults = evaluateFaults({ angles: unseen, phase: 'top', view: 'side', inFrame: true }).map(
+      (c) => c.fault,
+    )
+    expect(faults).not.toContain('sagging_hips')
+    expect(faults).not.toContain('piked_hips')
+    // ...while the faults that need no ankle still work on the very same frame.
+    const bentAndUnseen: PoseAngles = { ...unseen, elbow: 130 }
+    expect(
+      evaluateFaults({ angles: bentAndUnseen, phase: 'top', view: 'side', inFrame: true }).map((c) => c.fault),
+    ).toContain('no_lockout')
+  })
+
+  it('rates a soft lockout proportionately instead of screaming about every one', () => {
+    const { lockoutDeg, lockoutBands } = FAULT_THRESHOLDS
+    const severityAtTop = (elbow: number) =>
+      evaluateFaults({ angles: { ...straight, elbow }, phase: 'top', view: 'side', inFrame: true }).find(
+        (c) => c.fault === 'no_lockout',
+      )?.severity
+
+    // A real demonstrator's tops (121.7 - 151.0 on the repo's footage) must not all be severe:
+    // a severe fault pre-empts the utterance bucket and would drown out everything else.
+    expect(severityAtTop(lockoutDeg - 1)).toBe('minor')
+    expect(severityAtTop(lockoutDeg - lockoutBands.majorAtDeg)).toBe('major')
+    expect(severityAtTop(122)).toBe('major')
+    // Severe is reserved for a bent-arm hover, not a soft top.
+    expect(severityAtTop(lockoutDeg - lockoutBands.severeAtDeg)).toBe('severe')
+  })
+})
+
+describe('threshold coherence', () => {
+  it('accepts the shipped thresholds', () => {
+    expect(() => validateFaultThresholds()).not.toThrow()
+  })
+
+  it('rejects a lockout threshold that makes no_lockout unreachable', () => {
+    // Below `upEnterDeg`, every rep that completes has locked out by definition.
+    expect(() => validateFaultThresholds({ ...FAULT_THRESHOLDS, lockoutDeg: 110 }, 115)).toThrow(/lockoutDeg/)
+    expect(() => validateFaultThresholds({ ...FAULT_THRESHOLDS, lockoutDeg: 115 }, 115)).toThrow(/lockoutDeg/)
+  })
+
+  it('rejects a non-positive hip threshold, which would fault a straight back', () => {
+    expect(() => validateFaultThresholds({ ...FAULT_THRESHOLDS, sagDeg: 0 })).toThrow(/sagDeg/)
+    expect(() => validateFaultThresholds({ ...FAULT_THRESHOLDS, pikeDeg: -1 })).toThrow(/pikeDeg/)
+  })
+
+  it('leaves room between the rep threshold and the lockout threshold for the flag to live in', () => {
+    expect(FAULT_THRESHOLDS.lockoutDeg).toBeGreaterThan(REP_THRESHOLDS.upEnterDeg)
   })
 })
 

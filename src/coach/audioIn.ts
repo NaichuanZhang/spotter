@@ -22,16 +22,24 @@
  * exactly right — we are asserting the user was not speaking, and while the coach
  * is talking over them that is true enough for a demo.
  *
- * The cost is barge-in: you cannot interrupt the coach mid-sentence, because the
- * interruption is never transmitted. That is a deliberate trade, chosen over a
- * mic that triggers itself.
+ * The cost USED to be barge-in: you could not interrupt the coach mid-sentence,
+ * because the interruption was never transmitted. It is now recoverable, and the
+ * reason is that capture never stopped — only transmission did. While the gate is
+ * shut this file still receives every buffer, measures its RMS, and offers it to
+ * `onBuffer`; `bargeIn.ts` decides from those levels whether the user is really
+ * talking, and `micUplink` then re-opens the gate. THE GATE IS RE-CONSULTED AFTER
+ * `onBuffer` RETURNS, which is what lets the very buffer that proved the user was
+ * speaking be the first one sent rather than the first one dropped.
  *
  * Music is deliberately NOT gated — see musicPlayer.ts. Gating on music would
  * mute the user for the whole track, so "stop the music" could never be heard.
  * Music ducks instead, and browser AEC handles the residue.
  *
  * Browser echo cancellation is requested as a second line of defence, since the
- * gate cannot cover the moment the coach starts mid-buffer.
+ * gate cannot cover the moment the coach starts mid-buffer — and it is now
+ * LOAD-BEARING for barge-in, which can only tell the user apart from the coach
+ * because the coach's voice is largely cancelled out of the captured signal. See
+ * bargeIn.ts's header.
  */
 
 /** Everything tunable in one place — this gets adjusted by ear, not by reasoning. */
@@ -59,6 +67,16 @@ export const AUDIO_IN_CONFIG = {
   silenceFloor: 0.004,
 } as const
 
+/**
+ * One capture buffer, in ms — ~85 ms at 2048 frames / 24 kHz.
+ *
+ * Derived here, in the file that owns both numbers, because three modules need it and a
+ * hand-copied 85 is how a change to `bufferSize` silently shortens a timing window
+ * somewhere else. Re-exported as `BUFFER_PERIOD_MS` by micUplink for its own callers.
+ */
+export const AUDIO_IN_BUFFER_PERIOD_MS =
+  (AUDIO_IN_CONFIG.bufferSize / AUDIO_IN_CONFIG.sampleRate) * 1000
+
 export type AudioInErrorCode = 'unsupported_browser' | 'mic_denied' | 'mic_failed'
 
 export class AudioInError extends Error {
@@ -70,6 +88,31 @@ export class AudioInError extends Error {
   }
 }
 
+/**
+ * One captured buffer offered to a monitor, gated or not. This is the seam barge-in
+ * needs: the level of audio we are about to THROW AWAY is the only evidence that the
+ * user is trying to interrupt.
+ */
+export interface AudioInBuffer {
+  /**
+   * 0..1 RMS of this buffer. Computed for EVERY buffer, including gated ones — that
+   * is the change barge-in required, and it costs one pass over 2048 floats.
+   */
+  readonly level: number
+  /** What `gateOpen()` said for this buffer, BEFORE the monitor ran. */
+  readonly gated: boolean
+  /**
+   * base64 PCM16 of this buffer, for a monitor that wants to keep it (barge-in's
+   * pre-roll does).
+   *
+   * SYNCHRONOUS ONLY. Web Audio reuses the underlying channel data as soon as the
+   * callback returns, so a deferred call would encode whatever the next buffer put
+   * there — silently, as plausible-looking audio. Calling it late therefore THROWS
+   * rather than returning garbage.
+   */
+  takeBase64(): string
+}
+
 export interface AudioInOptions {
   /** Called with base64 PCM16 ready for `input_audio_buffer.append`. */
   readonly onChunk: (base64Pcm: string) => void
@@ -77,8 +120,18 @@ export interface AudioInOptions {
    * Consulted per buffer. Return false while the coach is speaking. Kept as a
    * predicate rather than a setter so the caller owns the truth and there is no
    * stale duplicate of "is the coach talking" to drift out of sync.
+   *
+   * Consulted TWICE when it says false and an `onBuffer` monitor is installed: once
+   * before the monitor, once after. The second call is what lets barge-in claim the
+   * buffer it triggered on instead of losing the user's first syllable.
    */
   readonly gateOpen: () => boolean
+  /**
+   * Every buffer, gated or not, before the gate decision is acted on. Optional: with
+   * no monitor installed this file behaves exactly as it did, gate check first and
+   * nothing encoded while shut.
+   */
+  readonly onBuffer?: (buffer: AudioInBuffer) => void
   readonly onError?: (error: AudioInError) => void
 }
 
@@ -108,6 +161,51 @@ function toBase64Pcm16(samples: Float32Array): string {
     binary += String.fromCharCode(...pcm.subarray(i, i + CHUNK))
   }
   return btoa(binary)
+}
+
+/**
+ * Hands one buffer to the monitor with a lazily-encoded payload, then expires it.
+ *
+ * Lazy because most gated buffers are never kept: barge-in only wants the last few, so
+ * encoding all of them would burn a btoa per 85 ms beside MediaPipe for nothing. Expired
+ * afterwards because the alternative to throwing is a monitor that stores a closure over
+ * a buffer Web Audio has already refilled, and gets back audio from the wrong moment —
+ * plausible-sounding, wrong, and effectively undebuggable.
+ *
+ * A throwing monitor is reported and does NOT stop capture: barge-in is additive, and
+ * losing the microphone because a detector had a bad buffer is a far worse outcome.
+ */
+function offerToMonitor(
+  options: AudioInOptions,
+  input: Float32Array,
+  level: number,
+  gated: boolean,
+): void {
+  let live = true
+  const buffer: AudioInBuffer = {
+    level,
+    gated,
+    takeBase64: () => {
+      if (!live) {
+        throw new AudioInError(
+          'mic_failed',
+          'takeBase64() was called after its buffer expired; encode inside onBuffer or not at all.',
+        )
+      }
+      return toBase64Pcm16(input)
+    },
+  }
+  try {
+    options.onBuffer?.(buffer)
+  } catch (cause) {
+    options.onError?.(
+      new AudioInError('mic_failed', 'A microphone buffer monitor threw; capture continues.', {
+        cause,
+      }),
+    )
+  } finally {
+    live = false
+  }
 }
 
 function rms(samples: Float32Array): number {
@@ -165,15 +263,22 @@ export function createAudioIn(options: AudioInOptions): AudioIn {
 
     processor.onaudioprocess = (event) => {
       const input = event.inputBuffer.getChannelData(0)
+      // Always measured, even when the gate is shut: a level we never compute is a
+      // barge-in we can never detect. One pass over 2048 floats.
+      const level = rms(input)
+      const shut = !options.gateOpen()
 
-      if (!options.gateOpen()) {
+      if (options.onBuffer) offerToMonitor(options, input, level, shut)
+
+      // Re-consulted, deliberately: the monitor may have just opened the gate, and if
+      // it did, THIS buffer is the start of the user's sentence.
+      if (shut && !options.gateOpen()) {
         gated = true
         lastLevel = 0
         return
       }
       gated = false
 
-      const level = rms(input)
       lastLevel = level
       if (level < AUDIO_IN_CONFIG.silenceFloor) return
 
