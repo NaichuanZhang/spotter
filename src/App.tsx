@@ -21,7 +21,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CoachEvent, WorkoutState } from './types/events'
-import type { GetHeartRateResult, PersonaId, ToolRegistry } from './types/tools'
+import type { PersonaId, ToolRegistry } from './types/tools'
 import { createPoseEngine } from './pose/poseEngine'
 import type { PoseEngine } from './pose/poseEngine'
 import { createCoachSession } from './coach/session'
@@ -32,8 +32,6 @@ import type { MicState } from './coach/micUplink'
 import { createMusicPlayer } from './coach/musicPlayer'
 import type { MusicPlayer, TrackId } from './coach/musicPlayer'
 import type { MusicController, MusicDucker } from './coach/musicControl'
-import { createHeartRateState, repsPerMinute, step as stepHeartRate, toHeartRateResult } from './mock/heartRate'
-import type { HeartRateState } from './mock/heartRate'
 import IntroScreen from './ui/IntroScreen'
 import WorkoutScreen from './ui/WorkoutScreen'
 import EndingScreen from './ui/EndingScreen'
@@ -119,15 +117,6 @@ function nextUtterance(previous: Utterance | null, text: string, final: boolean)
   }
 }
 
-/**
- * The heart rate simulation ticks at 5Hz but the displayed reading is rounded, so
- * most ticks are visually identical. Returning the PREVIOUS object when nothing
- * observable moved keeps the HUD from re-rendering for an unchanged number.
- */
-function sameReading(a: GetHeartRateResult, b: GetHeartRateResult): boolean {
-  return a.bpm === b.bpm && a.zone === b.zone && a.trend === b.trend
-}
-
 function writeVoiceLevel(store: { current: number }, level: number): void {
   const clamped = Number.isFinite(level) ? Math.min(1, Math.max(0, level)) : 0
   if (Math.abs(clamped - store.current) < SESSION.VOICE_EPSILON) return
@@ -142,15 +131,6 @@ export default function App() {
   const [persona, setPersona] = useState<PersonaId>('mean')
   const [workout, setWorkout] = useState<WorkoutState>(IDLE_WORKOUT)
   const [fps, setFps] = useState(0)
-  // Two representations of ONE simulation, on purpose:
-  //   heartRef   — the live state the physics steps; read by the get_heart_rate
-  //                tool handler, which needs the freshest value, not a render-old one.
-  //   heartBeat  — the displayed reading. A ref mutation does not re-render, so the
-  //                number on screen MUST come from state. Both are written in the
-  //                same interval below; nothing reads heartRef during render.
-  const [heartBeat, setHeartBeat] = useState<GetHeartRateResult>(() =>
-    toHeartRateResult(createHeartRateState()),
-  )
   const [conn, setConn] = useState<ConnState>('idle')
   // Pushed from the session (damped there, so this is not a 10 Hz re-render) rather
   // than polled: a denied mic has to show up the moment the prompt is dismissed.
@@ -171,8 +151,6 @@ export default function App() {
   const sessionRef = useRef<CoachSession | null>(null)
   const musicRef = useRef<MusicPlayer | null>(null)
   const personaRef = useRef<PersonaId>('mean')
-  const heartRef = useRef<HeartRateState>(createHeartRateState())
-  const repTimesRef = useRef<readonly number[]>([])
   const voiceRef = useRef(0)
   /**
    * The set, accumulated. A ref rather than state on purpose: nothing renders it until
@@ -180,8 +158,6 @@ export default function App() {
    * per event for a number nobody is looking at yet.
    */
   const ledgerRef = useRef<SetLedger>(EMPTY_LEDGER)
-  /** Highest SIMULATED reading of the set. Published by the 5 Hz tick below. */
-  const peakBpmRef = useRef(0)
   const finishRef = useRef<FinishLatch>(OPEN_LATCH)
   /** Which summary has already had its closing line spoken. Exactly one push per set. */
   const spokenForRef = useRef<SetSummary | null>(null)
@@ -276,7 +252,6 @@ export default function App() {
       summariseSet({
         ledger: ledgerRef.current,
         target,
-        peakBpm: peakBpmRef.current,
         reason,
         now: performance.now(),
       }),
@@ -294,11 +269,8 @@ export default function App() {
         setFaultCandidate({ fault: event.fault, severity: event.severity, at: event.at, valueDeg: event.valueDeg })
       } else if (event.kind === 'out_of_frame') {
         setFaultCandidate({ fault: 'out_of_frame', severity: 'major', at: event.at })
-      } else if (event.kind === 'rep_completed') {
-        repTimesRef.current = [...repTimesRef.current, event.at]
       } else if (event.kind === 'set_started') {
         setSummary(null)
-        repTimesRef.current = []
       } else if (event.kind === 'set_ended') {
         setSummary(summarise(event.totalReps, event.cleanReps, event.faults))
       }
@@ -311,9 +283,9 @@ export default function App() {
       }
 
       // The coach hears everything EXCEPT set_ended. Its wrap-up line is superseded by
-      // the ending screen's closing line, which carries the duration, the best depth,
-      // the peak pulse and the body-line caveat as well — and two wrap-ups in a row is
-      // one wrap-up too many.
+      // the ending screen's closing line, which carries the duration, the best depth
+      // and the body-line caveat as well — and two wrap-ups in a row is one wrap-up
+      // too many.
       const session = sessionRef.current
       if (session && event.kind !== 'set_ended') {
         safely('coach pushEvent', () => session.pushEvent(event))
@@ -335,7 +307,6 @@ export default function App() {
     (): ToolRegistry =>
       createToolHandlers({
         getWorkoutState: () => engineRef.current?.getState() ?? null,
-        getHeartRate: () => toHeartRateResult(heartRef.current),
         setPersona: (next) => {
           applyPersona(next)
           return true
@@ -431,13 +402,7 @@ export default function App() {
   const goAgain = useCallback(() => {
     finishRef.current = OPEN_LATCH
     ledgerRef.current = EMPTY_LEDGER
-    repTimesRef.current = []
-    peakBpmRef.current = 0
     spokenForRef.current = null
-    // The simulation was PAUSED through the rest (its tick only runs on the workout
-    // screen), so it has no idea how long the user rested. Restarting from rest is the
-    // honest option; carrying a five-minute-stale 150 bpm into set two is not.
-    heartRef.current = createHeartRateState()
     setEnding(null)
     setSummary(null)
     setFaultCandidate(null)
@@ -505,33 +470,20 @@ export default function App() {
     },
   })
 
-  // HUD numerals + the simulated heart rate advance on one clock, and that clock
-  // MUST be performance.now(): repTimesRef holds `event.at` values, which the pose
-  // engine stamps with performance.now() (ms since page load). Mixing in Date.now()
-  // here silently puts every rep timestamp ~1.7e12 ms "in the past", so
-  // repsPerMinute filters them all out, returns 0, and the simulated heart rate
-  // never leaves its resting value no matter how hard the user works. Both clocks
-  // are `number`, so neither tsc nor the bundler can catch the swap.
+  // THE ONLY POLLING TIMER IN THE APP, and the only thing that advances the HUD's
+  // clock and fps between pose events. Do not add a second one: every numeral on the
+  // workout screen is expected to move in step, and two intervals at the same nominal
+  // rate drift against each other within seconds.
   //
-  // This is also the ONLY place the displayed heart rate is published. Do not add a
-  // second timer for it, and do not let the HUD read heartRef: a ref mutation is
-  // invisible to React, so the widget would freeze at 64 bpm exactly as it used to.
+  // Nothing here reads a wall clock. The pose engine owns the set's elapsed time and
+  // stamps every `CoachEvent.at` from performance.now() (ms since page load); this
+  // effect only copies what the engine already computed. Anything added here that
+  // needs a timestamp must use performance.now() too — mixing in Date.now() puts the
+  // two ~1.7e12 ms apart, and both are `number`, so neither tsc nor the bundler can
+  // catch the swap. That mistake has already cost this repo one whole-set defect.
   useEffect(() => {
     if (screen !== 'workout') return undefined
-    let previousTick = performance.now()
     const timer = window.setInterval(() => {
-      const now = performance.now()
-      const elapsed = now - previousTick
-      previousTick = now
-      const heart = stepHeartRate(heartRef.current, elapsed, repsPerMinute(repTimesRef.current, now))
-      heartRef.current = heart
-      const reading = toHeartRateResult(heart)
-      setHeartBeat((previous) => (sameReading(previous, reading) ? previous : reading))
-      // The peak is read once, at the end of the set. Tracked here because this is the
-      // only place the simulation is stepped, and a peak sampled anywhere else would
-      // miss whatever happened between two renders.
-      if (reading.bpm > peakBpmRef.current) peakBpmRef.current = reading.bpm
-
       const engine = engineRef.current
       if (!engine) return
       safely('pose state poll', () => {
@@ -614,7 +566,6 @@ export default function App() {
           onPersona={applyPersona}
           workout={workout}
           fps={fps}
-          heart={heartBeat}
           conn={conn}
           offline={offline}
           mic={micState}

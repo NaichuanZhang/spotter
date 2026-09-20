@@ -252,4 +252,19 @@ describe('syntheticRep', () => {
     const mid = { ...createRepMachineState(), phase: 'bottom' as const }
     expect(syntheticRep(mid, 0).state.phase).toBe('bottom')
   })
+
+  /**
+   * The assumption the production gate rests on, measured rather than assumed.
+   *
+   * `poseEngine.injectSyntheticRep` and the F hotkey are both behind
+   * `if (import.meta.env.DEV)`, which keeps a shipped bundle from fabricating a rep. That
+   * is only safe if the test runner is on the live side of the gate — vitest reports
+   * MODE 'test', DEV true, PROD false. If someone runs the suite in production mode this
+   * fails HERE, loudly, instead of the engine silently no-opping and the browser test
+   * losing its only route past a camera it does not have.
+   */
+  it('runs on the live side of the production gate, so the gate cannot hide it', () => {
+    expect(import.meta.env.DEV).toBe(true)
+    expect(import.meta.env.PROD).toBe(false)
+  })
 })

@@ -113,7 +113,21 @@ function buildEventLines(count) {
   return Array.from({ length: count }, (_, i) => toEventLine(script[i % script.length]))
 }
 
-/** Local stand-ins for the browser tool handlers. Never throw; return {error}. */
+/**
+ * The default track id, read out of the schema the model is actually given rather than
+ * hand-copied. `musicPlayer.ts` owns the real list but reaches for AudioContext at import
+ * time, so a Node probe cannot load it; TOOL_DEFS is the next-closest single source.
+ */
+const PROBE_DEFAULT_TRACK =
+  TOOL_DEFS.find((tool) => tool.name === 'play_music')?.parameters?.properties?.track?.enum?.[0] ?? null
+
+/**
+ * Local stand-ins for the browser tool handlers. Never throw; return {error}.
+ *
+ * One entry per name in TOOL_DEFS: a tool the model is offered but that has no stub here
+ * gets answered `{error: unknown tool ...}`, which is a probe defect the model then has to
+ * talk its way around. Add the entry in the same commit that adds the tool.
+ */
 const PROBE_TOOL_RESULTS = {
   show_reference: (args) => ({
     shown: true,
@@ -130,8 +144,21 @@ const PROBE_TOOL_RESULTS = {
     setElapsedSec: 41,
     phase: 'top',
   }),
-  get_heart_rate: () => ({ bpm: 138, zone: 'aerobic', trend: 'rising', simulated: true }),
   log_set: (args) => ({ logged: true, summary: `${args?.reps ?? 0} reps logged` }),
+  // There are no speakers in a probe, so this reports what a browser that accepted
+  // playback would report — `playing` false on stop, exactly as PlayMusicResult requires.
+  play_music: (args) => {
+    const stopping = args?.action === 'stop'
+    const track = stopping ? null : (args?.track ?? PROBE_DEFAULT_TRACK)
+    return {
+      action: stopping ? 'stop' : 'play',
+      playing: !stopping,
+      track,
+      label: track,
+      approxSec: null,
+      detail: stopping ? 'Music stopped.' : `Playing ${track}.`,
+    }
+  },
 }
 
 // ---------------------------------------------------------------- helpers

@@ -56,8 +56,6 @@ export interface SetSummary {
   readonly partialReps: number
   readonly elapsedSec: number
   readonly bestDepthPct: number
-  /** Simulated, always. 0 when the simulation never produced a reading. */
-  readonly peakBpm: number
   readonly faults: readonly FaultType[]
   readonly coverage: BodyLineCoverage
   readonly measuredReps: number
@@ -67,7 +65,6 @@ export interface SetSummary {
 export interface SummariseInput {
   readonly ledger: SetLedger
   readonly target: number
-  readonly peakBpm: number
   readonly reason: FinishReason
   /** Same monotonic clock the events carry. Only used if the set never ended. */
   readonly now: number
@@ -97,7 +94,6 @@ export function summariseSet(input: SummariseInput): SetSummary {
       SUMMARY_LIMITS.maxElapsedSec,
     ),
     bestDepthPct: Math.min(clampInt(ledger.bestDepthPct, 100), 100),
-    peakBpm: clampInt(input.peakBpm, 400),
     faults: ledger.faults,
     coverage: coverageOf(ledger),
     measuredReps: Math.min(clampInt(ledger.measuredReps, SUMMARY_LIMITS.maxReps), reps),
@@ -195,7 +191,6 @@ export function closingLine(summary: SetSummary): string {
   if (summary.partialReps > 0) bits.push(`${summary.partialReps} partial`)
   bits.push(`${Math.round(summary.elapsedSec)}s total`)
   if (summary.reps > 0) bits.push(`best depth ${summary.bestDepthPct}%`)
-  if (summary.peakBpm > 0) bits.push(`peak heart rate ${summary.peakBpm} bpm estimated`)
   const faults = speakableFaults(summary)
   bits.push(faults.length > 0 ? `faults seen: ${faults.join(', ')}` : 'no faults')
   bits.push(bodyLineClause(summary))

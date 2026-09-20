@@ -3,10 +3,9 @@
  * state threaded by the caller.
  *
  * Every rep still goes into the counter and the workout state — the pose engine emits
- * `rep_completed` for all of them and the HUD, the heart-rate model and `WorkoutState` all
- * keep seeing every one. This file only decides which of them the coach OPENS ITS MOUTH
- * for, which used to be "all of them" and is the reason it felt like a machine reading a
- * log file out loud.
+ * `rep_completed` for all of them, and both the HUD and `WorkoutState` keep seeing every
+ * one. This file only decides which of them the coach OPENS ITS MOUTH for, which used to
+ * be "all of them" and is the reason it felt like a machine reading a log file out loud.
  *
  * WHY MILESTONES AND NOT JUST A THROTTLE. "Every 4th rep" alone trades one broken-feeling
  * coach for another: a human spotter that spoke on reps 4, 8 and 12 and ignored the rep you

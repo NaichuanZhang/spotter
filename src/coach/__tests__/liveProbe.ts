@@ -380,7 +380,6 @@ export interface Probe {
 export interface ProbeOptions {
   readonly persona?: PersonaId
   readonly workout?: WorkoutState
-  readonly heartBpm?: number
   /** Fail play_music the way a browser autoplay refusal does. */
   readonly refuseMusic?: boolean
   /**
@@ -442,7 +441,6 @@ export function createProbe(options: ProbeOptions = {}): Probe {
   // The SHIPPED handlers, so the probe exercises toolHandlers.ts rather than a stand-in.
   const registry: ToolRegistry = createToolHandlers({
     getWorkoutState: () => options.workout ?? DEFAULT_WORKOUT,
-    getHeartRate: () => ({ bpm: options.heartBpm ?? 138, zone: 'aerobic', trend: 'rising' }),
     setPersona: () => true,
     showReference: () => true,
     logSet: () => true,

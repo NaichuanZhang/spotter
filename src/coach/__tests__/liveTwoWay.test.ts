@@ -256,8 +256,11 @@ describe.skipIf(!PROBE.live || PROBE.key === '')('live two-way voice', () => {
   }, 180_000)
 
   it('answers a spoken turn that needs two tools', async () => {
-    const clip = await ttsPcm24k('Put a song on, and tell me what my heart rate is.')
-    const probe = createProbe({ persona: 'nice', heartBpm: 147 })
+    // Two asks in one sentence, which is how users actually talk. Both halves are
+    // tool-backed: play_music acts, get_workout_state answers. (This scenario used to
+    // ask for a heart rate as its second half — see amendment 2 in src/types/tools.ts.)
+    const clip = await ttsPcm24k('Put a song on, and tell me how many reps I have done.')
+    const probe = createProbe({ persona: 'nice' })
     await probe.session.connect()
     await sleep(MIC_ARM_MS)
     await probe.mic.speak(clip.samples)
@@ -276,18 +279,25 @@ describe.skipIf(!PROBE.live || PROBE.key === '')('live two-way voice', () => {
     await probe.session.destroy()
   }, 150_000)
 
-  it('regression: get_heart_rate still fires when asked out loud', async () => {
-    const clip = await ttsPcm24k('Hey, what is my heart rate right now?')
-    const probe = createProbe({ persona: 'mean', heartBpm: 141 })
+  /**
+   * The spoken-ask-to-tool-call path, which was pinned against `get_heart_rate` until
+   * amendment 2 removed it. Retargeted rather than deleted: what this measures is that
+   * a question asked OUT LOUD reaches a handler instead of being answered from
+   * invention, and get_workout_state is now the only tool the coach reads numbers out
+   * of, so it inherits the guard.
+   */
+  it('regression: a spoken question still reaches get_workout_state', async () => {
+    const clip = await ttsPcm24k('Hey, how many reps have I done so far?')
+    const probe = createProbe({ persona: 'mean' })
     await probe.session.connect()
     await sleep(MIC_ARM_MS)
     for (let trial = 0; trial < 3; trial++) {
       await probe.mic.speak(clip.samples)
       await sleep(10_000)
     }
-    log(probe, 'get_heart_rate x3 spoken')
-    const calls = probe.tools.filter((call) => call.name === 'get_heart_rate').length
-    say(`[get_heart_rate] ${calls}/3 asks produced a call`)
+    log(probe, 'get_workout_state x3 spoken')
+    const calls = probe.tools.filter((call) => call.name === 'get_workout_state').length
+    say(`[get_workout_state] ${calls}/3 asks produced a call`)
     say(`[captions] ${probe.captions.join(' | ')}`)
     expect(calls).toBeGreaterThan(0)
     await probe.session.destroy()

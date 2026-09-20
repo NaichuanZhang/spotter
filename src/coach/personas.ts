@@ -9,11 +9,13 @@
  *
  * TOOLS sits AFTER character, and that position was forced by measurement. With the
  * tool rules buried mid-prompt inside CORE, the live model called ZERO tools across
- * six runs (3 with this prompt, 3 with the previous one) — it answered "what's my
- * heart rate?" by inventing a bpm (72, 132, 180 and 78 were all observed) instead of
- * calling get_heart_rate, while a short control prompt whose last line was a tool
- * order fired 3/3 on the same session frame and the same TOOL_DEFS. The rules had not
- * changed in months; their POSITION and their framing were the whole defect.
+ * six runs (3 with this prompt, 3 with the previous one) — asked for a number only a
+ * tool could supply it invented one (four different values were observed on the same
+ * question) instead of calling the tool that held it, while a short control prompt
+ * whose last line was a tool order fired 3/3 on the same session frame and the same
+ * TOOL_DEFS. The rules had not changed in months; their POSITION and their framing
+ * were the whole defect. (That measurement used `get_heart_rate`, removed in
+ * amendment 2 of src/types/tools.ts; the finding is about position, not that tool.)
  *
  * Written for a realtime voice model: short declarative rules, concrete example
  * lines, no hedging. Caps are stated as hard numbers because the model obeys
@@ -179,7 +181,8 @@ A clean rep, or a reading marked MINOR: full stops, and hold the marks back.`
  *   1. "costs you no words" — otherwise the word cap above reads as a reason to
  *      skip the call and just talk.
  *   2. "you do not know the number until it answers" — otherwise the model
- *      cheerfully invents a bpm, which is the one number it must never invent.
+ *      cheerfully invents the figure it was asked for, which is the one thing a
+ *      tool-backed number must never be.
  */
 const TOOLS = `YOUR TOOLS — A TOOL CALL IS AN ACTION, NOT A SENTENCE
 Calling a tool costs you no words and breaks no rule above.
@@ -191,11 +194,7 @@ Every single one. Rep two or rep ninety. However long you have been coaching.
 The trigger is the reading, not your mood: it fires when you are being kind too.
 Skipping it is a failure. A cooldown of twenty seconds is the only excuse.
 If asked how they are doing, call get_workout_state, then quote what it returns.
-If asked about heart rate, call get_heart_rate, then quote what it returns.
-You do not know their heart rate until that tool answers you.
-Never guess a heart rate. Never say a number the tool did not give you.
-That number is estimated from rep tempo, not measured by a sensor.
-Call it estimated. Never claim it came from a real device.
+You do not know their totals until that tool answers you. Never guess them.
 When the user says they are finished, or hits the target, call log_set.
 If the user asks for a different coach, call set_persona.`
 

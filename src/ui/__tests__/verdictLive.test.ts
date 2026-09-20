@@ -32,7 +32,6 @@ function summaryFor(overrides: Partial<SetLedger>) {
   return summariseSet({
     ledger: { ...EMPTY_LEDGER, startedAt: 1000, lastRepAt: 89_000, endedAt: 89_000, ...overrides },
     target: 20,
-    peakBpm: 151,
     reason: 'target_reached',
     now: 90_000,
   })

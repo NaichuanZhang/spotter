@@ -102,7 +102,6 @@ function summary(overrides: Partial<SetSummary> = {}): SetSummary {
       endedAt: 89_000,
     },
     target: 20,
-    peakBpm: 151,
     reason: 'target_reached',
     now: 90_000,
   })
@@ -140,7 +139,7 @@ describe('the closing line on the wire', () => {
     expect(item).toContain('20 of 20 reps')
     expect(item).toContain('18 clean (no fault detected)')
     expect(item).toContain('body line not visible')
-    expect(item).toContain('peak heart rate 151 bpm estimated')
+    expect(item).toContain('best depth 96%')
     // Never on the Realtime wire: TTS-3 tags do nothing here and can be read aloud.
     expect(item).not.toContain('<|')
   })

@@ -53,3 +53,8 @@ shots/
 # (see public/clips/landmarks.json). Only the derived motion data and our own
 # drawing ship; no frame of the source video is in this repo.
 
+
+# Local agent credentials
+.insta/agent-session.json
+
+.insta/.agent-session-*.tmp

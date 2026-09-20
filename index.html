@@ -8,6 +8,10 @@
     />
     <title>SPOTTER — your coach can see you</title>
     <meta name="theme-color" content="#05070A" />
+    <!-- There is no favicon asset. Declaring an empty data URI stops the browser
+         asking for /favicon.ico, which the Node server correctly 404s — the only
+         console error the app otherwise produces, on every single page load. -->
+    <link rel="icon" href="data:," />
     <link rel="preconnect" href="https://api.boson.ai" crossorigin />
   </head>
   <body>

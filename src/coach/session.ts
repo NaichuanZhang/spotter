@@ -216,7 +216,8 @@ export interface CoachSessionOptions {
    *
    * Deliberately NOT `Date.now`: a clock adjustment mid-set would make the coach either
    * mute or non-stop, and this repo has already paid for mixing those two domains once
-   * (heart rate reported a resting pulse for an entire set).
+   * (the mocked heart rate, since removed, read a resting pulse for a whole set because
+   * its rep timestamps landed in another clock's past).
    */
   now?: () => number
 }
@@ -346,7 +347,7 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
     /**
      * One clock for the whole session. Without this the uplink falls back to `Date.now()`
      * while everything else here runs on `performance.now()` — the same mixing of domains
-     * that once made heart rate report a resting pulse for an entire set. Barge-in's hold
+     * that once cost this repo a whole set of readings (see `now` above). Barge-in's hold
      * and refractory windows are all deltas, so they stay self-consistent either way, but
      * `Date.now()` is not monotonic and an NTP or DST step mid-set would corrupt them.
      */
@@ -552,9 +553,9 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
   }
 
   /**
-   * THE CHOKE POINT. Every event still arrives here — the HUD, the counter and the
-   * heart-rate model are fed upstream by the engine's own listeners and are untouched by
-   * this — and the policy decides which of them becomes a sentence.
+   * THE CHOKE POINT. Every event still arrives here — the HUD and the counter are fed
+   * upstream by the engine's own listeners and are untouched by this — and the policy
+   * decides which of them becomes a sentence.
    *
    * The socket check stays FIRST so the policy only ever judges events it could actually
    * have spoken: an event dropped because there is no socket must not count as a rep the

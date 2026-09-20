@@ -11,7 +11,7 @@
  * a duplicate getUserMedia call is not.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { GetHeartRateResult, PersonaId } from '../types/tools'
+import type { PersonaId } from '../types/tools'
 import type { WorkoutState } from '../types/events'
 import type { MicState } from '../coach/micUplink'
 import type { TrackId } from '../coach/musicPlayer'
@@ -55,8 +55,6 @@ interface WorkoutScreenProps {
   readonly onPersona: (persona: PersonaId) => void
   readonly workout: WorkoutState
   readonly fps: number
-  /** Simulated heart rate, already lifted into App state — never read from a ref. */
-  readonly heart: GetHeartRateResult
   readonly conn: ConnState
   readonly offline: boolean
   /** Mic uplink health, straight from the coach session. */
@@ -90,7 +88,6 @@ export default function WorkoutScreen({
   onPersona,
   workout,
   fps,
-  heart,
   conn,
   offline,
   mic,
@@ -170,7 +167,6 @@ export default function WorkoutScreen({
             cleanReps={workout.cleanReps}
             elapsedSec={workout.setElapsedSec}
             fps={fps}
-            heart={heart}
             conn={conn}
             offline={offline}
             inFrame={workout.inFrame}

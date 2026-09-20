@@ -6,6 +6,12 @@
  * this IS the glass panel; the fault chips are `--fault` because a fault is a fault;
  * no persona hue touches a numeral.
  *
+ * EVERY STAT HERE WAS MEASURED. The PEAK HEART row that used to sit under the rep
+ * row was a simulation wearing a SIMULATED pill, and it went with the rest of the
+ * heart-rate mock (amendment 2 in src/types/tools.ts). Nothing modelled goes back on
+ * this panel — a stat beside four measured ones reads as measured however it is
+ * labelled.
+ *
  * ONE DELIBERATE EXCEPTION TO "CLEAN IS BLUE". When the body line was never
  * measurable, the clean count is rendered in plain ink instead of `--metric-clean`,
  * because a hue that means "good" next to a number that only means "nothing was
@@ -57,18 +63,6 @@ export default function EndingStats({ summary }: EndingStatsProps) {
           </div>
         </dl>
       </div>
-
-      {/* Same permanent SIMULATED pill the HUD carries: there is no reading of this
-          metric that is not simulated, so the word is not conditional. */}
-      <dl className="ending__heart">
-        <dt className="ending__heartLabel">
-          PEAK HEART <span className="ending__heartSim">SIMULATED</span>
-        </dt>
-        <dd className="ending__heartValue">
-          <span className="ending__heartBpm">{summary.peakBpm > 0 ? summary.peakBpm : '--'}</span>
-          <span className="ending__heartUnit">BPM</span>
-        </dd>
-      </dl>
 
       <div className="ending__faults">
         <span className="ending__faultsLabel">FAULTS SEEN</span>

@@ -55,7 +55,6 @@ function fakeMusic(overrides: Partial<MusicController> = {}): {
 function handlers(music: MusicController): ToolRegistry {
   return createToolHandlers({
     getWorkoutState: () => null,
-    getHeartRate: () => null,
     setPersona: () => true,
     showReference: () => true,
     logSet: () => true,

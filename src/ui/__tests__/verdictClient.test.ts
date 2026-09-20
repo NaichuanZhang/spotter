@@ -50,7 +50,6 @@ function summary(overrides: Partial<Parameters<typeof summariseSet>[0]['ledger']
       ...overrides,
     },
     target: 20,
-    peakBpm: 148,
     reason: 'target_reached',
     now: 90_000,
   })

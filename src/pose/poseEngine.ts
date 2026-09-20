@@ -145,7 +145,11 @@ export interface PoseEngine {
   getFps(): number
   setView(view: CameraView): void
   setTarget(target: number): void
-  /** Demo-day hotkey: score a rep the camera did not see. */
+  /**
+   * DEV BUILDS ONLY: score a rep the camera did not see. A no-op in a production bundle —
+   * the method stays on the interface so callers need no gate of their own, but the body is
+   * compiled out. See the implementation for why it is gated rather than removed.
+   */
   injectSyntheticRep(overrides?: Partial<RepMetrics>): void
   isRunning(): boolean
 }
@@ -540,6 +544,19 @@ export function createPoseEngine(options: PoseEngineOptions): PoseEngine {
       target = next
     },
     injectSyntheticRep(overrides) {
+      /*
+       * THE PRODUCTION GATE. A keystroke that adds a pushup the user did not do must not
+       * exist in a shipped build, and the counts it fabricates flow straight into the set
+       * ledger and the coach's mouth. `import.meta.env.DEV` is a literal `false` after
+       * Vite's define pass, so everything below is unreachable and tree-shaken out of the
+       * bundle along with `syntheticRep` and `SYNTHETIC_REP`.
+       *
+       * NOT deleted, on purpose: headless Chromium has no camera, so the browser test has
+       * no other way to reach the ending screen. `vitest` runs with DEV true, so unit tests
+       * see the real body. See the block comment above `SYNTHETIC_REP` in `repMachine.ts`.
+       */
+      if (!import.meta.env.DEV) return
+
       const t = performance.now()
       const result = syntheticRep(reps, t, overrides)
       reps = result.state

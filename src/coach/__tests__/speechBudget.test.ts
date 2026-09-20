@@ -174,8 +174,8 @@ describe('the REAL recorded pushups, replayed through the real pose pipeline', (
 describe('only SPEECH is throttled — the counter, cleanReps and the HUD are unaffected', () => {
   /**
    * The structural argument is that `session.pushEvent` is a SINK: the engine's own listeners
-   * feed the HUD, the rep counter and the heart-rate model upstream of it, and the policy runs
-   * inside the session. But "it cannot happen" is how the heart-rate defect survived, so this
+   * feed the HUD and the rep counter upstream of it, and the policy runs inside the session.
+   * But "it cannot happen" is how the clock-domain defect survived a whole set, so this
    * measures it instead: the same 20 events, both arms, and the counting fields compared.
    */
   it('a 20-rep set still totals 20 reps while the coach says a handful of lines', async () => {

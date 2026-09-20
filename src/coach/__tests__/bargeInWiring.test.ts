@@ -37,7 +37,8 @@
  *
  * `now` is a second, independent fix: without it the uplink runs on `Date.now()` while the
  * session runs on `performance.now()` — the mixed-clock-domain bug this repo has already paid
- * for once (heart rate read a resting pulse for a whole set). See the last case.
+ * for once (the since-removed heart-rate mock read a resting pulse for a whole set; the mock
+ * is gone, the clock rule it bought is not). See the last case.
  *
  * Verified load-bearing by mutation, both reverted: dropping `interruptCoach` fails 3 of the
  * 6 cases here, dropping `now` fails 1.
@@ -344,8 +345,8 @@ describe('the gap is one missing option, not a broken detector', () => {
    *
    * `createMicUplink`'s own default is `Date.now()`, and the session runs on
    * `performance.now()`. Mixing the two is the class of bug that already cost this repo a
-   * whole set of heart-rate readings, and `Date.now()` is not monotonic — an NTP or DST step
-   * mid-set would corrupt the hold and refractory windows.
+   * whole set of readings from the since-removed heart-rate mock, and `Date.now()` is not
+   * monotonic — an NTP or DST step mid-set would corrupt the hold and refractory windows.
    *
    * This case cannot check the two clocks are equal (they are both real clocks in the app),
    * so it checks the property that only holds if the session THREADS ITS OWN clock through:

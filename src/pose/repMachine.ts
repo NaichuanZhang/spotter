@@ -366,9 +366,23 @@ export function step(state: RepMachineState, frame: RepFrame): RepStepResult {
   return state.phase === 'top' ? stepTop(state, frame) : stepBottom(state, frame)
 }
 
-// ------------------------------------------------------------------- demo-day hook
+// ------------------------------------------------------------- dev-only rep injection
 
-/** A believable clean rep, for the demo hotkey. Tunable in one place like everything else. */
+/*
+ * WHY THIS IS STILL HERE, GATED, RATHER THAN DELETED.
+ *
+ * Fabricating a rep the camera never saw has no place in a shipped product, so the only
+ * caller — `poseEngine.injectSyntheticRep`, reached by the F hotkey — is compiled out of a
+ * production bundle behind `import.meta.env.DEV`. It is not deleted because headless
+ * Chromium has no camera: without an injectable rep the browser test cannot reach the
+ * ending screen at all, and `vitest` (which reports `import.meta.env.DEV === true`, pinned
+ * by a test in `__tests__/repMachine.test.ts`) uses these two exports directly.
+ *
+ * So: DO NOT "finish the job" by removing them. The gate is the whole fix; removing the
+ * capability costs the browser test its only route past the camera.
+ */
+
+/** A believable clean rep, for the dev-only hotkey. Tunable in one place like everything else. */
 export const SYNTHETIC_REP = {
   minElbowAngle: 84,
   maxElbowAngle: 176,
@@ -378,9 +392,12 @@ export const SYNTHETIC_REP = {
 } as const
 
 /**
- * Score a rep that the camera did not see, for demo-day hotkeys. Routed through the
- * same counters and the same `rep_completed` shape as a real rep so nothing
- * downstream can tell the difference — and so the counts stay consistent.
+ * Score a rep that the camera did not see. Routed through the same counters and the same
+ * `rep_completed` shape as a real rep so nothing downstream can tell the difference — and
+ * so the counts stay consistent.
+ *
+ * Pure, and therefore NOT gated itself: the gate belongs at the one call site that a user
+ * can reach (`poseEngine.injectSyntheticRep`). Tests call this directly.
  *
  * Does not touch `phase`: the user may be mid-rep when the key is pressed.
  */

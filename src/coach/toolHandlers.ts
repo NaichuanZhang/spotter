@@ -1,5 +1,5 @@
 /**
- * The six tools, executing in the browser. Dependencies are injected rather than
+ * The five tools, executing in the browser. Dependencies are injected rather than
  * imported so a handler can be unit-tested with three lines of fakes and never
  * touches React state directly.
  *
@@ -18,7 +18,6 @@ import { isPersonaId } from './personas'
 import { isTrackId, MUSIC_CONFIG, TRACK_IDS } from './musicPlayer'
 import type { MusicController } from './musicControl'
 import type {
-  GetHeartRateResult,
   GetWorkoutStateResult,
   LogSetArgs,
   LogSetResult,
@@ -104,8 +103,6 @@ export interface ReferenceClip {
 export interface ToolHandlerDeps {
   /** Live pose state. Null before the first frame or if the camera died. */
   getWorkoutState: () => WorkoutState | null
-  /** Simulated HR. `simulated: true` is stamped here, not by the caller. */
-  getHeartRate: () => Omit<GetHeartRateResult, 'simulated'> | null
   /** Swap the coach. Return false if the swap could not be applied. */
   setPersona: (persona: PersonaId) => boolean | void
   /** Render the reference card. Return false if the UI refused. */
@@ -177,17 +174,6 @@ export function createToolHandlers(deps: ToolHandlerDeps): ToolRegistry {
       setElapsedSec: Math.round(state.setElapsedSec),
       phase: state.phase,
     } satisfies GetWorkoutStateResult
-  }
-
-  const getHeartRate: ToolHandler = () => {
-    const reading = deps.getHeartRate()
-    if (!reading) return { error: 'the heart rate estimate is not running yet' }
-    return {
-      bpm: Math.round(reading.bpm),
-      zone: reading.zone,
-      trend: reading.trend,
-      simulated: true,
-    } satisfies GetHeartRateResult
   }
 
   const logSet: ToolHandler = (rawArgs) => {
@@ -270,7 +256,6 @@ export function createToolHandlers(deps: ToolHandlerDeps): ToolRegistry {
     show_reference: guard('show_reference', showReference),
     set_persona: guard('set_persona', setPersona),
     get_workout_state: guard('get_workout_state', getWorkoutState),
-    get_heart_rate: guard('get_heart_rate', getHeartRate),
     log_set: guard('log_set', logSet),
     play_music: guard('play_music', playMusic),
   }

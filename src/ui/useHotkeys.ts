@@ -1,10 +1,15 @@
 /**
- * Demo-day keyboard controls.
+ * Keyboard controls.
  *
- * Every key here exists so a human on a stage can force a moment to happen on
- * cue: fake a rep, swap the coach, kick the socket. The listener is registered
- * once and reads the latest actions out of a ref, so passing fresh closures from
- * App does not thrash window listeners.
+ * Every key here exists so a human can force a moment to happen on cue: swap the
+ * coach, kick the socket, show the captions. The listener is registered once and
+ * reads the latest actions out of a ref, so passing fresh closures from App does
+ * not thrash window listeners.
+ *
+ * ONE key, F, is dev-only. It fabricates a rep, which a shipped build must not be
+ * able to do; `import.meta.env.DEV` gates both the binding and its help entry so
+ * the overlay never advertises a key that does nothing. The capability survives
+ * for tests and local development — see `poseEngine.injectSyntheticRep`.
  */
 import { useEffect, useRef } from 'react'
 import type { PersonaId } from '../types/tools'
@@ -19,9 +24,15 @@ export interface HotkeyActions {
   onEscape: () => void
 }
 
-/** Rendered by the '?' overlay. Single source of truth for what the keys do. */
-export const HOTKEY_HINTS: readonly { readonly keys: string; readonly label: string }[] = [
-  { keys: 'F', label: 'inject a synthetic rep' },
+export interface HotkeyHint {
+  readonly keys: string
+  readonly label: string
+}
+
+/** Dev builds only, and labelled as such so nobody demos it by accident. */
+const DEV_HOTKEY_HINTS: readonly HotkeyHint[] = [{ keys: 'F', label: 'inject a synthetic rep (dev only)' }]
+
+const SHIPPED_HOTKEY_HINTS: readonly HotkeyHint[] = [
   { keys: '1 / 2 / 3', label: 'mean / nice / sarcastic' },
   { keys: 'R', label: 'reconnect the coach' },
   { keys: 'O', label: 'toggle the offline badge' },
@@ -29,6 +40,14 @@ export const HOTKEY_HINTS: readonly { readonly keys: string; readonly label: str
   { keys: '?', label: 'show or hide this list' },
   { keys: 'Esc', label: 'dismiss overlays' },
 ]
+
+/**
+ * Rendered by the '?' overlay. Single source of truth for what the keys do, and it has to
+ * track the gate below: a production overlay that lists F would be advertising a no-op.
+ */
+export const HOTKEY_HINTS: readonly HotkeyHint[] = import.meta.env.DEV
+  ? [...DEV_HOTKEY_HINTS, ...SHIPPED_HOTKEY_HINTS]
+  : SHIPPED_HOTKEY_HINTS
 
 const PERSONA_BY_DIGIT: Readonly<Record<string, PersonaId>> = {
   '1': 'mean',
@@ -71,7 +90,9 @@ export function useHotkeys(actions: HotkeyActions, enabled = true): void {
       }
 
       const handlers: Readonly<Record<string, (() => void) | undefined>> = {
-        f: actionsNow.onSyntheticRep,
+        // Dev-only. `undefined` falls through the `if (!handler) return` below, so in a
+        // production build F is simply not a hotkey — it is not a hotkey that does nothing.
+        f: import.meta.env.DEV ? actionsNow.onSyntheticRep : undefined,
         r: actionsNow.onReconnect,
         o: actionsNow.onToggleOffline,
         c: actionsNow.onToggleCaptions,

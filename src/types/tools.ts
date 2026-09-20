@@ -1,6 +1,6 @@
 /**
  * Tool definitions handed to Higgs Realtime, plus the result shapes our handlers
- * return. All six handlers execute IN THE BROWSER — the state they read is owned by
+ * return. All five handlers execute IN THE BROWSER — the state they read is owned by
  * the pose engine or the browser's own audio graph, so none makes a network call.
  *
  * Protocol rules verified against the live API (see plan):
@@ -31,6 +31,26 @@
  *        which is why this file now imports from ../coach. A hand-copied list here
  *        would be a second source of truth for what is on disk in public/music/,
  *        and the kind of runtime-string drift that cost this repo four bugs already.
+ *
+ * 2. `get_heart_rate` REMOVED, with `GetHeartRateResult` and the whole
+ *    `src/mock/heartRate.ts` simulation behind it (hackathon-over subtraction pass,
+ *    at the user's explicit instruction). The number was never measured: it was a
+ *    first-order lag driven by rep tempo, labelled SIMULATED on screen and stamped
+ *    `simulated: true` in the result precisely because it was invented. That
+ *    labelling was the right way to demo a fabricated vital and the wrong thing to
+ *    keep once the product is being built for real — a coach that reports a vital
+ *    sign should be reading a sensor, and there is no sensor. Removing it is
+ *    cheaper than maintaining the honesty scaffolding around a fiction.
+ *
+ *    What went with it, so nothing is left half-removed: the `ToolName` member and
+ *    its TOOL_DEFS entry, `GetHeartRateResult` and its arm of `ToolResult`, the
+ *    handler and its `ToolHandlerDeps.getHeartRate` injection, the four prompt lines
+ *    in personas.ts that taught the coach to call it and to say "estimated", the HUD
+ *    row and its SIMULATED pill, `--metric-heart`, and `SetSummary.peakBpm` with the
+ *    ending screen's PEAK HEART stat and the `peak heart rate ... estimated` clause
+ *    of `closingLine`. The /api/verdict contract needed no change: `peakBpm` was
+ *    never one of its accepted keys, and its validator already 400s on an
+ *    unexpected field, so the route rejects it today.
  */
 
 import { TRACK_IDS } from '../coach/musicPlayer'
@@ -43,7 +63,6 @@ export type ToolName =
   | 'show_reference'
   | 'set_persona'
   | 'get_workout_state'
-  | 'get_heart_rate'
   | 'log_set'
   | 'play_music'
 
@@ -104,13 +123,6 @@ export const TOOL_DEFS = [
   },
   {
     type: 'function',
-    name: 'get_heart_rate',
-    description:
-      'Get the user current heart rate. NOTE: this value is simulated, not from a real sensor. Never claim it came from a real device.',
-    parameters: { type: 'object', properties: {}, required: [] },
-  },
-  {
-    type: 'function',
     name: 'log_set',
     description:
       'Close out the current set and show the user a summary card. Call this when the user says they are done, or when they reach the target rep count.',
@@ -131,9 +143,10 @@ export const TOOL_DEFS = [
   /**
    * THE DESCRIPTION IS LOAD-BEARING, and that is a measurement, not a style note.
    * With the tool rules framed as background prose the live model called ZERO tools
-   * across six runs on this same TOOL_DEFS — it answered "what's my heart rate?" by
-   * inventing a number rather than calling the tool that had one. What fixed it was
-   * naming the user's ACTUAL WORDS and making the call an order.
+   * across six runs on this same TOOL_DEFS — asked for a number only a tool could
+   * supply, it invented one rather than calling the tool that had it (the tool in
+   * that measurement was `get_heart_rate`, since removed — see amendment 2). What
+   * fixed it was naming the user's ACTUAL WORDS and making the call an order.
    *
    * So this description lists real phrasings instead of describing a category, and it
    * says outright that speaking is not acting: a realtime voice model's default
@@ -197,15 +210,6 @@ export interface GetWorkoutStateResult {
   phase: 'top' | 'bottom'
 }
 
-export interface GetHeartRateResult {
-  bpm: number
-  zone: 'rest' | 'warmup' | 'aerobic' | 'threshold' | 'max'
-  trend: 'rising' | 'steady' | 'falling'
-  /** Always true. Lives in the RESULT, not just the UI, so the model cannot
-   *  claim this came from a real sensor even if it wanted to. */
-  simulated: true
-}
-
 export interface LogSetArgs {
   reps: number
   cleanReps: number
@@ -251,7 +255,6 @@ export type ToolResult =
   | ShowReferenceResult
   | SetPersonaResult
   | GetWorkoutStateResult
-  | GetHeartRateResult
   | LogSetResult
   | PlayMusicResult
   | ToolErrorResult

@@ -44,7 +44,7 @@ export const FRAME = { width: 640, height: 360, fps: 30 }
  * in src/pose/repMachine.ts (mirrored into landmarks.json `tunables.rep`).
  */
 const DEPTH = {
-  /** Past upEnterDeg (155) and descentStartDeg (165): an unambiguous lockout. */
+  /** Past upEnterDeg (115) and descentStartDeg (165): an unambiguous lockout. */
   lockout: 175,
   /** Under depthFullDeg (80), so this bottom scores depthPct 100. */
   full: 76,
@@ -171,8 +171,9 @@ const FAULTS = {
     /**
      * The soft top is not a number I chose: it is the SOURCE VIDEO's own top of rep, read
      * out of landmarks.json at render time. That demonstrator never locked out — the
-     * extraction measured tops of 123-153 deg and the app's upEnterDeg of 155 therefore
-     * scored zero of their six real reps — so "a rep that stops short at the top" is
+     * extraction measured tops of 123-153 deg and the app's THEN-CURRENT upEnterDeg of 155
+     * therefore scored zero of their six real reps (it is 115 now, and scores all six, which
+     * is why the check below changed direction) — so "a rep that stops short at the top" is
      * exactly the geometry the real footage contains, and this clip shows it rather than
      * an invented approximation of it.
      *
@@ -247,9 +248,21 @@ export function claimsFor(fault, view, thresholds) {
     partial_depth: [
       { what: 'half rep stops short of the partial flag', half: 'wrong', metric: 'elbow3d', bound: 'min', op: '>', value: thresholds.partialAboveDeg, views: all },
     ],
+    /*
+     * The soft top must land INSIDE the band `(upEnterDeg, lockoutDeg]` — the rep counts
+     * AND the arm never straightened — because that band is the whole reason `no_lockout`
+     * is a quality flag rather than a gate (see `FAULT_THRESHOLDS.lockoutDeg`).
+     *
+     * The second check used to read `max < upEnterDeg`, i.e. "would never complete a rep".
+     * That was true and correct when `upEnterDeg` was 155, at which point `no_lockout` was
+     * unreachable dead code for exactly the same reason. Recalibrating to 115 made the
+     * fault real and made the old assertion contradict it: the clip's 123.1 deg top, read
+     * from the source footage, now scores a rep on purpose. The clip did not change; the
+     * threshold it is checked against did.
+     */
     no_lockout: [
       { what: 'soft top stays short of a lockout', half: 'wrong', metric: 'elbow3d', bound: 'max', op: '<=', value: thresholds.lockoutDeg, views: all },
-      { what: 'soft top would never complete a rep', half: 'wrong', metric: 'elbow3d', bound: 'max', op: '<', value: thresholds.upEnterDeg, views: all },
+      { what: 'soft top still completes a rep, so the flag is reachable', half: 'wrong', metric: 'elbow3d', bound: 'max', op: '>', value: thresholds.upEnterDeg, views: all },
     ],
     craned_neck: [
       { what: 'neck is craned', half: 'wrong', metric: 'neck', bound: 'min', op: '<=', value: thresholds.neckMinDeg, views: ['side'] },

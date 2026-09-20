@@ -139,6 +139,20 @@ describe('validateVerdictStats', () => {
     expect(result.message).toMatch(/unexpected field/)
   })
 
+  /**
+   * A field REMOVED from the client contract must come back as a 400, not be quietly
+   * ignored. `peakBpm` is the live case: it was a SetSummary field until amendment 2 in
+   * src/types/tools.ts cut the heart-rate mock, and it was never one of ACCEPTED_KEYS.
+   * Silently tolerating a stale field is how a route drifts into an open relay, so the
+   * allow-list is asserted to stay closed rather than merely to have shrunk.
+   */
+  it('rejects a field the client contract has dropped, rather than ignoring it', () => {
+    const result = validateVerdictStats({ ...GOOD, peakBpm: 151 })
+    expect(result.ok).toBe(false)
+    expect(result.field).toBe('peakBpm')
+    expect(result.message).toMatch(/unexpected field/)
+  })
+
   it('dedupes faults, reports the collapse, and orders them deterministically', () => {
     const { stats, notes } = accept({ faults: ['no_lockout', 'sagging_hips', 'no_lockout'] })
     expect(stats.faults).toEqual(['sagging_hips', 'no_lockout'])

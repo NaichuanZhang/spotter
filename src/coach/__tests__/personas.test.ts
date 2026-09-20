@@ -5,9 +5,11 @@
  *
  * The ORDERING assertion is the important one. Measured against the live API: with
  * the tool rules buried mid-prompt the model called ZERO tools in six runs and
- * invented a heart rate instead of calling get_heart_rate. Moving the block to sit
- * after CHARACTER and before SAFETY is what made the calls happen, so the position
- * is a behavioural contract, not formatting.
+ * invented the number it was asked for instead of calling the tool that held it (the
+ * tool in that measurement was `get_heart_rate`, removed in amendment 2 of
+ * src/types/tools.ts). Moving the block to sit after CHARACTER and before SAFETY is
+ * what made the calls happen, so the position is a behavioural contract, not
+ * formatting.
  */
 import { describe, expect, it } from 'vitest'
 import {
@@ -138,10 +140,22 @@ describe.each(ALL.map((persona) => [persona.id, persona] as const))('%s instruct
     expect(text).toMatch(/Call the tool FIRST/i)
   })
 
-  it('forbids inventing a heart rate and requires the estimated caveat', () => {
-    expect(text).toMatch(/Never guess a heart rate/i)
-    expect(text).toMatch(/estimated/i)
-    expect(text).toMatch(/Never claim it came from a real device/i)
+  /**
+   * What is left of the heart-rate honesty rules after amendment 2 removed that tool.
+   * The clause that still earns its place is the one that made the call happen at all
+   * — "you do not know it until the tool answers" — so it is pinned against
+   * get_workout_state, which is now the only tool the coach reads numbers out of.
+   */
+  it('forbids guessing the totals get_workout_state owns', () => {
+    expect(text).toMatch(/call get_workout_state, then quote what it returns/i)
+    expect(text).toMatch(/You do not know their totals until that tool answers you/i)
+    expect(text).toMatch(/Never guess them/i)
+  })
+
+  it('no longer teaches a heart rate it cannot measure', () => {
+    expect(text).not.toMatch(/heart rate/i)
+    expect(text).not.toMatch(/get_heart_rate/)
+    expect(text).not.toMatch(/\bbpm\b/i)
   })
 
   it('fires show_reference off the reading rather than the persona mood', () => {

@@ -40,8 +40,8 @@ function ledger(overrides: Partial<SetLedger> = {}): SetLedger {
   }
 }
 
-function summarise(overrides: Partial<SetLedger> = {}, peakBpm = 148): SetSummary {
-  return summariseSet({ ledger: ledger(overrides), target: 20, peakBpm, reason: 'target_reached', now: 90_000 })
+function summarise(overrides: Partial<SetLedger> = {}): SetSummary {
+  return summariseSet({ ledger: ledger(overrides), target: 20, reason: 'target_reached', now: 90_000 })
 }
 
 describe('coverageOf', () => {
@@ -70,7 +70,6 @@ describe('summariseSet', () => {
       cleanReps: 18,
       partialReps: 2,
       bestDepthPct: 96,
-      peakBpm: 148,
       coverage: 'seen',
       reason: 'target_reached',
     })
@@ -91,8 +90,8 @@ describe('summariseSet', () => {
   })
 
   it('survives a set that never started', () => {
-    const summary = summariseSet({ ledger: EMPTY_LEDGER, target: 20, peakBpm: 0, reason: 'set_ended', now: 5000 })
-    expect(summary).toMatchObject({ reps: 0, elapsedSec: 0, peakBpm: 0, coverage: 'unseen' })
+    const summary = summariseSet({ ledger: EMPTY_LEDGER, target: 20, reason: 'set_ended', now: 5000 })
+    expect(summary).toMatchObject({ reps: 0, elapsedSec: 0, coverage: 'unseen' })
   })
 })
 
@@ -167,9 +166,18 @@ describe('closingLine', () => {
     }
   })
 
-  it('labels the simulated heart rate estimated, and omits it when there is no reading', () => {
-    expect(closingLine(summarise({}, 148))).toContain('peak heart rate 148 bpm estimated')
-    expect(closingLine(summarise({}, 0))).not.toContain('heart rate')
+  /**
+   * The line used to carry a `peak heart rate N bpm estimated` clause off a simulated
+   * reading. It went with the rest of the mock (amendment 2 in src/types/tools.ts),
+   * and this asserts the absence rather than just dropping the old case: the coach
+   * speaks this line verbatim, so a modelled number reappearing here is a modelled
+   * number said out loud as fact.
+   */
+  it('quotes no vital sign — every number in the line was measured', () => {
+    const line = closingLine(summarise())
+    expect(line).not.toMatch(/heart rate/i)
+    expect(line).not.toMatch(/\bbpm\b/i)
+    expect(line).not.toMatch(/estimated/i)
   })
 
   it('uses the frozen contract wording for an unseen body line', () => {
@@ -200,7 +208,7 @@ describe('closingLine', () => {
   })
 
   it('names the route that ended the set', () => {
-    const logged = summariseSet({ ledger: ledger(), target: 20, peakBpm: 0, reason: 'coach_logged_set', now: 0 })
+    const logged = summariseSet({ ledger: ledger(), target: 20, reason: 'coach_logged_set', now: 0 })
     expect(closingLine(logged)).toContain('set complete — coach logged set')
   })
 })
