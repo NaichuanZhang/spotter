@@ -147,8 +147,25 @@ export const URGENCY_SPEED: Readonly<Record<Severity, number>> = Object.freeze({
  */
 export const VOICE_RETRY = { attempts: 3, delayMs: 2_000 } as const
 
-/** Innocuous, prefixed like every other pushed line so it cannot be read aloud. */
-export const HEARTBEAT_LINE = '[EVENT] keepalive — no reply needed'
+/**
+ * Innocuous, prefixed like every other pushed line so it cannot be read aloud.
+ *
+ * IT MUST PROVOKE A REPLY. Measured 2026-09-21, two arms at the same cadence:
+ * appending items WITHOUT `response.create` for 270 s died at exactly 300254 ms with
+ * `{"type":"session.idle_timeout","seconds_idle":300}` and close reason "Idle timeout:
+ * no user speech for 300s"; the arm that let the model SPEAK survived 409 s with zero
+ * user speech. Conversation activity does not reset the server's clock — a model
+ * utterance does.
+ *
+ * So a silent keepalive is not a keepalive. This is latent today only because the
+ * coach speaks on almost every rep, and it becomes fatal the moment pacing improves:
+ * a coach that has learned to stay quiet kills its own session mid-set.
+ *
+ * The reply is deliberately shaped to be near-silent rather than absent — the cost of
+ * holding the session open is one short line every four minutes.
+ */
+export const HEARTBEAT_LINE =
+  '[EVENT] keepalive. Reply with exactly one short word of encouragement, nothing more.'
 
 /**
  * The server's own voice-activity edges for the USER, which is how the listen window knows
@@ -307,8 +324,15 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
    * Mic frames deliberately do NOT touch `lastPushAt`: that timestamp guards the
    * 4-minute keepalive against the server's 5-minute no-speech close, and a mic buffer
    * is not proof of speech — a quiet room still produces buffers above the silence
-   * floor. If the user really is talking, the server's own idle timer is reset by the
-   * audio itself, and the extra keepalive is harmless either way.
+   * floor.
+   *
+   * CORRECTION (measured 2026-09-21). This comment used to claim that "if the user
+   * really is talking, the server's own idle timer is reset by the audio itself". That
+   * is FALSE, and it mattered: 3525 appends carrying 14.44 MB over 301 s were closed by
+   * `session.idle_timeout` anyway. Appended audio does not reset the clock — only a
+   * model utterance does. Not touching `lastPushAt` here is still right, but for the
+   * opposite reason: mic activity is no evidence the session is safe, so the keepalive
+   * must keep firing regardless of how much the user is talking.
    */
   const tap = createSocketTap({
     base: options.socket,
@@ -853,7 +877,9 @@ export function createCoachSession(options: CoachSessionOptions = {}): CoachSess
     heartbeatTimer = setInterval(() => {
       if (!conn?.isOpen()) return
       if (Date.now() - lastPushAt < COACH_TIMING.heartbeatMs) return
-      conn.pushUserText(HEARTBEAT_LINE, { respond: false })
+      // respond:true is LOAD-BEARING, not a style choice. A silent append leaves the
+      // server's no-user-speech clock running — see HEARTBEAT_LINE for the measurement.
+      conn.pushUserText(HEARTBEAT_LINE, { respond: true })
       lastPushAt = Date.now()
       debug('pushed keepalive')
     }, COACH_TIMING.heartbeatCheckMs)
