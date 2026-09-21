@@ -23,7 +23,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CoachEvent, WorkoutState } from './types/events'
 import type { PersonaId, ToolRegistry } from './types/tools'
 import { createPoseEngine } from './pose/poseEngine'
-import type { PoseEngine } from './pose/poseEngine'
+import type { PoseEngine, PoseEngineError, PoseEngineErrorCode } from './pose/poseEngine'
+import { CAMERA_PICKER, recalledCamera, rememberCamera } from './pose/cameras'
 import { createCoachSession } from './coach/session'
 import type { CoachSession, CoachSessionOptions, CoachStatus } from './coach/session'
 import { createToolHandlers, summarise } from './coach/toolHandlers'
@@ -34,6 +35,7 @@ import type { MusicPlayer, TrackId } from './coach/musicPlayer'
 import type { MusicController, MusicDucker } from './coach/musicControl'
 import IntroScreen from './ui/IntroScreen'
 import WorkoutScreen from './ui/WorkoutScreen'
+import CameraPicker from './ui/CameraPicker'
 import EndingScreen from './ui/EndingScreen'
 import { latchFinish, OPEN_LATCH } from './ui/finishGate'
 import type { FinishLatch, FinishReason } from './ui/finishGate'
@@ -65,6 +67,18 @@ const IDLE_WORKOUT: WorkoutState = {
   activeFaults: [],
   setElapsedSec: 0,
   inFrame: true,
+}
+
+/**
+ * The camera failures that need a SENTENCE, not just a log line. Both are invisible
+ * otherwise: a substituted camera looks like a working app pointed at the wrong room, and
+ * a camera that ended mid-set holds its last frame, which is indistinguishable from a user
+ * lying still. Copy comes from `CAMERA_PICKER.COPY` so the picker and the shell cannot
+ * describe the same event two different ways.
+ */
+const CAMERA_NOTICE: Readonly<Partial<Record<PoseEngineErrorCode, string>>> = {
+  camera_substituted: CAMERA_PICKER.COPY.REMEMBERED_MISSING,
+  camera_ended: CAMERA_PICKER.COPY.TRACK_ENDED,
 }
 
 const STATUS_TO_CONN: Readonly<Record<CoachStatus, ConnState>> = {
@@ -144,6 +158,15 @@ export default function App() {
   const [faultCandidate, setFaultCandidate] = useState<FaultCandidate | null>(null)
   const [summary, setSummary] = useState<string | null>(null)
   const [fatal, setFatal] = useState<string | null>(null)
+  /**
+   * Which camera to open. Seeded from the remembered choice, which may name a device that
+   * is no longer here — that is the pose engine's problem to survive, not this one's, and
+   * it does (`camera_substituted`). The preference is deliberately NOT cleared when a
+   * fallback happens: an iPhone that is asleep today is still the camera the user wants.
+   */
+  const [cameraId, setCameraId] = useState<string | null>(() => recalledCamera())
+  /** Non-fatal camera news, shown as a banner. Cleared on the next deliberate choice. */
+  const [cameraNotice, setCameraNotice] = useState<string | null>(null)
   /** The finished set. Its IDENTITY drives the closing line and the avatar render. */
   const [ending, setEnding] = useState<SetSummary | null>(null)
 
@@ -152,6 +175,12 @@ export default function App() {
   const musicRef = useRef<MusicPlayer | null>(null)
   const personaRef = useRef<PersonaId>('mean')
   const voiceRef = useRef(0)
+  /**
+   * The chosen camera, readable from a callback whose IDENTITY must not change when the
+   * choice does. `handleVideoReady` is a dependency of WorkoutScreen's claim effect, and
+   * re-running that effect is precisely the camera race this repo already fixed once.
+   */
+  const cameraIdRef = useRef<string | null>(cameraId)
   /**
    * The set, accumulated. A ref rather than state on purpose: nothing renders it until
    * the set is over, so folding it into state would re-render the workout screen once
@@ -407,9 +436,44 @@ export default function App() {
     setSummary(null)
     setFaultCandidate(null)
     setClip(null)
+    // Set one's camera news does not belong over set two. A camera that is still missing
+    // will say so again the moment the new engine opens it.
+    setCameraNotice(null)
     setWorkout(IDLE_WORKOUT)
     setFps(0)
     setScreen('workout')
+  }, [])
+
+  /**
+   * Non-fatal engine failures. Frame errors stay in the console; camera ones also reach
+   * the screen, because the engine is the only thing that knows which camera actually
+   * opened and it cannot draw.
+   */
+  const handleEngineError = useCallback((error: PoseEngineError) => {
+    console.warn(`[spotter] pose engine ${error.code}:`, error.message)
+    const notice = CAMERA_NOTICE[error.code]
+    if (notice) setCameraNotice(notice)
+  }, [])
+
+  /**
+   * The one door for "use that camera". Remembered immediately — the write is idempotent,
+   * and CameraPicker does it too — so a reload comes back on the same camera, and applied
+   * to a live set through switchCamera rather than by rebuilding the engine: the
+   * PoseLandmarker costs seconds and the rep count belongs to the user, not to the lens.
+   */
+  const selectCamera = useCallback((deviceId: string) => {
+    cameraIdRef.current = deviceId
+    setCameraId(deviceId)
+    rememberCamera(deviceId)
+    setCameraNotice(null)
+    const engine = engineRef.current
+    if (!engine) return
+    void engine.switchCamera(deviceId).catch((error: unknown) => {
+      // Reaching here means neither the chosen camera nor the default one could be
+      // opened — the engine already tried the fallback. The set is still running.
+      console.error('[spotter] camera switch failed:', describe(error))
+      setCameraNotice(CAMERA_PICKER.COPY.SWITCH_FAILED)
+    })
   }, [])
 
   /**
@@ -425,7 +489,10 @@ export default function App() {
         const options = {
           video,
           target: SESSION.TARGET_REPS,
-          onError: (error: unknown) => console.warn('[spotter] pose frame error:', describe(error)),
+          // The ref, not the state: see cameraIdRef. A set always starts on whatever
+          // camera is selected at that moment.
+          deviceId: cameraIdRef.current ?? undefined,
+          onError: handleEngineError,
         }
         const engine = createPoseEngine(options)
         engineRef.current = engine
@@ -441,7 +508,7 @@ export default function App() {
         return false
       }
     },
-    [handleEvent],
+    [handleEngineError, handleEvent],
   )
 
   /** Pulled once per animation frame by the skeleton overlay, never via state. */
@@ -557,7 +624,17 @@ export default function App() {
   return (
     <div className="app" data-persona={persona} data-screen={screen}>
       {screen === 'intro' ? (
-        <IntroScreen persona={persona} onPersona={applyPersona} onStart={start} target={SESSION.TARGET_REPS} />
+        <IntroScreen
+          persona={persona}
+          onPersona={applyPersona}
+          onStart={start}
+          target={SESSION.TARGET_REPS}
+          /* Chosen before the set, beside choosing a coach — and it is the same choice
+             either way: which camera can actually SEE a person on the floor. The engine
+             reads the result at start, and switchCamera handles it mid-set if the choice
+             changes while a set is running. */
+          cameraPicker={<CameraPicker deviceId={cameraId} onSelect={selectCamera} />}
+        />
       ) : screen === 'ending' && ending ? (
         <EndingScreen summary={ending} persona={persona} onAgain={goAgain} />
       ) : (
@@ -577,6 +654,7 @@ export default function App() {
           clip={clip}
           onDismissClip={dismissClip}
           getLandmarks={getLandmarks}
+          cameraDeviceId={cameraId}
           onVideoReady={handleVideoReady}
         />
       )}
@@ -584,6 +662,14 @@ export default function App() {
       {fatal ? (
         <p className="banner" role="alert">
           {fatal}
+        </p>
+      ) : cameraNotice ? (
+        // Only when nothing fatal is up: the two share one slot, and a camera note under
+        // "the pose engine could not start" would be the less useful of the two. It stays
+        // until the user does something about it — picking a camera, or starting a new
+        // set — because "your camera died" is not news to wipe off on a timer.
+        <p className="banner" role="status">
+          {cameraNotice}
         </p>
       ) : null}
 

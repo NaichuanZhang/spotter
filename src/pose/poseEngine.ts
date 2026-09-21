@@ -23,10 +23,18 @@
  * duration shares one monotonic timeline. Do not mix in `Date.now()` — a clock
  * adjustment mid-set would produce negative tempos.
  *
- * TUNABLES LIVE IN: `ENGINE_CONFIG` (this file).
+ * WHICH CAMERA: `options.deviceId` pins one (a propped-up iPhone sees a person on the
+ * floor; a laptop lid does not), and `switchCamera` changes it mid-set without touching
+ * the PoseLandmarker — the model costs seconds to build and knows nothing about which
+ * camera fed it. Everything about choosing, falling back and racing lives in
+ * `cameraStream.ts`, which is testable; what stays here is the `<video>` element.
+ *
+ * TUNABLES LIVE IN: `ENGINE_CONFIG` (this file), `CAMERA_STREAM` (cameraStream.ts).
  */
 
 import { FilesetResolver, PoseLandmarker } from '@mediapipe/tasks-vision'
+import type { CameraOwner, OpenedCamera } from './cameraStream'
+import { classifyCameraError, createCameraOwner } from './cameraStream'
 import type { CameraView, CoachEvent, FaultType, RepMetrics, WorkoutState } from '../types/events'
 import type { PoseAngles } from './angles'
 import { measureAngles } from './angles'
@@ -102,6 +110,19 @@ export type PoseEngineErrorCode =
   | 'unsupported_browser'
   | 'camera_denied'
   | 'camera_failed'
+  /**
+   * The chosen camera was not available, so the DEFAULT one opened instead. Not fatal —
+   * frames are flowing — but the user is watching a different camera than the one they
+   * picked, and a remembered iPhone that went home with its owner is the common cause.
+   */
+  | 'camera_substituted'
+  /**
+   * The live track ended on its own: the Continuity iPhone slept, or the webcam was
+   * unplugged. THE WORST VERSION OF THIS FAILURE IS SILENCE — a dead camera holds its
+   * last frame, which looks exactly like a user holding still, so the rep counter simply
+   * stops with no error anywhere. Hence its own code.
+   */
+  | 'camera_ended'
   | 'model_load_failed'
   | 'detect_failed'
   | 'listener_failed'
@@ -122,6 +143,12 @@ export interface PoseEngineOptions {
   target?: number
   view?: CameraView
   assets?: Partial<typeof ENGINE_CONFIG.assets>
+  /**
+   * Which `videoinput` to open. Omitted (or undefined) behaves exactly as before: the
+   * browser picks. A pinned device that has vanished falls back to the default camera and
+   * reports `camera_substituted` rather than failing to start.
+   */
+  deviceId?: string
   /** Non-fatal, per-frame failures land here. Fatal startup failures reject `start`. */
   onError?: (error: PoseEngineError) => void
 }
@@ -146,6 +173,23 @@ export interface PoseEngine {
   setView(view: CameraView): void
   setTarget(target: number): void
   /**
+   * Change camera without tearing anything else down: the PoseLandmarker, the rep count
+   * and the fault history all survive, because none of them is about which lens is
+   * pointing at the user. Geometry-dependent caches are reset (see `resetGeometry`).
+   *
+   * Overlapping calls are safe — the LAST one wins and the losers stop the streams they
+   * opened. Rejects when neither the requested camera nor the default one could be opened;
+   * a request for a device that is simply gone resolves after falling back, reporting
+   * `camera_substituted` through `onError`.
+   */
+  switchCamera(deviceId: string): Promise<void>
+  /**
+   * The deviceId of the camera actually running, read back from the live track rather
+   * than from what was requested — after a fallback those two differ. Null before `start`
+   * and after `stop`, and also when the browser withholds the id (no permission yet).
+   */
+  activeDeviceId(): string | null
+  /**
    * DEV BUILDS ONLY: score a rep the camera did not see. A no-op in a production bundle —
    * the method stays on the interface so callers need no gate of their own, but the body is
    * compiled out. See the implementation for why it is gated rather than removed.
@@ -156,42 +200,51 @@ export interface PoseEngine {
 
 // ------------------------------------------------------------------- media setup
 
-async function openCamera(video: HTMLVideoElement): Promise<MediaStream> {
-  if (!navigator.mediaDevices?.getUserMedia) {
+function requireCameraApi(): MediaDevices {
+  const media = navigator.mediaDevices
+  if (!media?.getUserMedia) {
     throw new PoseEngineError(
       'unsupported_browser',
       'This browser exposes no camera API. A secure context (https or localhost) is required.',
     )
   }
-  let stream: MediaStream
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ video: ENGINE_CONFIG.video, audio: false })
-  } catch (cause) {
-    const denied = cause instanceof DOMException && (cause.name === 'NotAllowedError' || cause.name === 'SecurityError')
-    throw new PoseEngineError(
-      denied ? 'camera_denied' : 'camera_failed',
-      denied ? 'Camera permission was denied.' : 'Could not open the camera.',
-      { cause },
-    )
-  }
+  return media
+}
+
+/**
+ * Put a stream on the element and start it. The stream is NOT stopped here on failure —
+ * `createCameraOwner` owns that, and two owners stopping one stream is how a working
+ * camera gets torn down by the loser of a race.
+ */
+async function attachStream(video: HTMLVideoElement, stream: MediaStream): Promise<void> {
   video.srcObject = stream
   video.playsInline = true
   video.muted = true
   await video.play().catch((cause: unknown) => {
     // An AbortError means a NEW load request superseded this play() — the browser
-    // autoplaying, or another owner reassigning srcObject. It is only fatal if the
-    // element actually ended up not playing; when frames are flowing the rejected
-    // promise is noise and tearing the stream down here would kill a working
-    // camera. Checked via readyState rather than `paused`, because `paused` is
-    // already false while a play() is still pending.
+    // autoplaying, another owner reassigning srcObject, or a camera SWITCH landing while
+    // this play() was still pending. It is only fatal if the element actually ended up not
+    // playing; when frames are flowing the rejected promise is noise and tearing the
+    // stream down here would kill a working camera. Checked via readyState rather than
+    // `paused`, because `paused` is already false while a play() is still pending.
     const aborted = cause instanceof DOMException && cause.name === 'AbortError'
     const flowing = video.readyState >= 2 /* HAVE_CURRENT_DATA */ && !video.ended
     if (aborted && flowing) return
 
-    stream.getTracks().forEach((t) => t.stop())
     throw new PoseEngineError('camera_failed', 'The video element refused to play.', { cause })
   })
-  return stream
+}
+
+/** Raw `getUserMedia` failure -> the engine's vocabulary. Nothing is swallowed. */
+function asCameraError(cause: unknown, requestedDeviceId: string | null): PoseEngineError {
+  if (cause instanceof PoseEngineError) return cause
+  const failure = classifyCameraError(cause, requestedDeviceId)
+  if (failure === 'denied') {
+    return new PoseEngineError('camera_denied', 'Camera permission was denied.', { cause })
+  }
+  // A device_unavailable that reaches here already survived the one fallback attempt in
+  // `openCameraStream`, so the default camera failed too — there is nothing left to try.
+  return new PoseEngineError('camera_failed', 'Could not open the camera.', { cause })
 }
 
 async function createLandmarker(assets: typeof ENGINE_CONFIG.assets): Promise<PoseLandmarker> {
@@ -223,10 +276,12 @@ export function createPoseEngine(options: PoseEngineOptions): PoseEngine {
   let view = options.view ?? ENGINE_CONFIG.defaultView
 
   let landmarker: PoseLandmarker | null = null
-  let stream: MediaStream | null = null
   let rafId: number | null = null
   let running = false
   let lastVideoTime = -1
+  /** What the user asked for. May differ from what opened — see `activeDeviceId`. */
+  let requestedDeviceId: string | null = options.deviceId ?? null
+  let activeDevice: string | null = null
 
   let reps: RepMachineState = createRepMachineState()
   let windows: AngleWindows = createAngleWindows()
@@ -246,6 +301,18 @@ export function createPoseEngine(options: PoseEngineOptions): PoseEngine {
   let latestLandmarks: readonly Landmark[] | null = null
 
   const fail = (error: PoseEngineError): void => options.onError?.(error)
+
+  /**
+   * The camera, and the only thing in this file that owns a MediaStream. It stops the old
+   * tracks before acquiring, so a switch can never leave two streams — and two camera
+   * lights — live, and it orders overlapping switches so the last click wins.
+   */
+  const camera: CameraOwner<MediaStream> = createCameraOwner<MediaStream>({
+    base: ENGINE_CONFIG.video,
+    getUserMedia: (constraints) => requireCameraApi().getUserMedia(constraints),
+    attach: (next) => attachStream(options.video, next),
+    onTrackEnded: (deviceId) => handleTrackEnded(deviceId),
+  })
 
   function emit(events: readonly CoachEvent[]): void {
     for (const event of events) {
@@ -467,21 +534,115 @@ export function createPoseEngine(options: PoseEngineOptions): PoseEngine {
     setStartedAt = t
   }
 
+  /**
+   * Everything a frame-space measurement assumed about the OLD camera. A lid camera at
+   * 1280x720 and an iPhone at 1920x1080 letterbox differently and sit at different
+   * heights, so normalised landmarks — and therefore every angle in the median windows —
+   * mean something different after a switch.
+   *
+   * What deliberately SURVIVES: the rep count, the clean count, `faultsSeen`, the
+   * utterance bucket and `setStartedAt`. The user did those reps; changing camera is not
+   * a new set, and resetting the gate would let the coach repeat a fault it just called.
+   */
+  function resetGeometry(t: number): void {
+    windows = createAngleWindows()
+    latestLandmarks = null
+    // Forces the next decoded frame through: `currentTime` restarts near zero on a new
+    // stream and would otherwise compare equal to the old camera's last timestamp.
+    lastVideoTime = -1
+    frameStamps = []
+    badFrames = 0
+    goodFrames = 0
+    // Null, not the last angle: the first frame of a new camera is not a movement.
+    lastElbow = null
+    lastIdleAt = null
+    lastMotionAt = t
+  }
+
+  /** Record what actually opened, and say so when it is not what was asked for. */
+  function adoptCamera(opened: OpenedCamera<MediaStream>): void {
+    activeDevice = opened.deviceId
+    if (!opened.fellBack) return
+    fail(
+      new PoseEngineError(
+        'camera_substituted',
+        'The camera you chose is no longer available, so the default camera opened instead.',
+      ),
+    )
+  }
+
+  /**
+   * A dead camera looks exactly like a still user, so this never stays quiet: it reports,
+   * then tries the default camera. If the iPhone is the one that slept, the lid camera is
+   * a worse view but an infinitely better one than a frozen frame.
+   */
+  function handleTrackEnded(deviceId: string | null): void {
+    if (!running) return
+    fail(
+      new PoseEngineError(
+        'camera_ended',
+        `The camera stopped sending frames${deviceId ? ` (device ${deviceId})` : ''}. Falling back to the default camera.`,
+      ),
+    )
+    void recoverDefaultCamera()
+  }
+
+  async function recoverDefaultCamera(): Promise<void> {
+    try {
+      const opened = await camera.acquire(null)
+      // Null means a real switch — or `stop()` — raced this recovery and won. Either way
+      // that request stopped this stream for us and owns whatever is live now.
+      if (!opened || !running) return
+      adoptCamera(opened)
+      resetGeometry(performance.now())
+    } catch (cause) {
+      // Nothing left to fall back to. Reported, not thrown: nobody awaits this.
+      fail(asCameraError(cause, null))
+    }
+  }
+
   async function start(): Promise<void> {
     if (running) return
+    // Before the expensive part: a browser with no camera API must not pay for a model.
+    requireCameraApi()
     landmarker = await createLandmarker(assets)
     try {
-      stream = await openCamera(options.video)
-    } catch (error) {
+      const opened = await camera.acquire(requestedDeviceId)
+      if (!opened) throw new PoseEngineError('camera_failed', 'The camera was released while starting.')
+      adoptCamera(opened)
+    } catch (cause) {
       landmarker.close()
       landmarker = null
-      throw error
+      throw asCameraError(cause, requestedDeviceId)
     }
     running = true
     const t = performance.now()
     resetSession(t)
     emit([{ kind: 'set_started', at: t, target }])
     rafId = requestAnimationFrame(tick)
+  }
+
+  /**
+   * The detect loop and the PoseLandmarker are untouched on purpose: the model takes
+   * seconds to build, knows nothing about which camera fed it, and `tick` already skips
+   * frames while `readyState` is below HAVE_CURRENT_DATA — which is exactly the gap
+   * between assigning a new srcObject and the first frame of the new camera.
+   */
+  async function switchCamera(deviceId: string): Promise<void> {
+    requestedDeviceId = deviceId
+    // Not running yet: the choice is recorded and `start` will honour it. Acquiring now
+    // would turn a camera light on for a set that has not begun.
+    if (!running) return
+    let opened: OpenedCamera<MediaStream> | null
+    try {
+      opened = await camera.acquire(deviceId)
+    } catch (cause) {
+      throw asCameraError(cause, deviceId)
+    }
+    // A later switch superseded this one and owns the camera; it will adopt its own.
+    if (!opened) return
+    adoptCamera(opened)
+    resetGeometry(performance.now())
   }
 
   function stop(): void {
@@ -501,8 +662,10 @@ export function createPoseEngine(options: PoseEngineOptions): PoseEngine {
       },
     ])
 
-    stream?.getTracks().forEach((track) => track.stop())
-    stream = null
+    // release() also invalidates any switch still in flight, so a stream that arrives
+    // after the set is over stops itself instead of lighting the camera back up.
+    camera.release()
+    activeDevice = null
     options.video.srcObject = null
     landmarker?.close()
     landmarker = null
@@ -511,6 +674,8 @@ export function createPoseEngine(options: PoseEngineOptions): PoseEngine {
   return {
     start,
     stop,
+    switchCamera,
+    activeDeviceId: () => activeDevice,
     onEvent(listener) {
       listeners.add(listener)
       return () => listeners.delete(listener)

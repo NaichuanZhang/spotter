@@ -13,6 +13,15 @@
  *     centre-cropped. Normalised landmarks must be mapped through that same
  *     transform or the skeleton drifts off the body near the edges.
  *
+ * NOTHING ABOUT THE VIDEO IS CACHED ACROSS FRAMES, and that is load-bearing now that
+ * the user can switch cameras mid-set: `videoWidth`/`videoHeight` and the canvas box are
+ * re-read every tick, so a 1280x720 lid camera and a 1920x1080 iPhone letterbox
+ * correctly without anyone telling this component that anything changed. The one thing
+ * a re-measure cannot fix is the FIRST frame after a switch, where the landmarks in hand
+ * were measured in the old camera's frame space — those are dropped (see `geometryRef`)
+ * rather than projected through the new letterbox, which would put the skeleton visibly
+ * off the body.
+ *
  * Landmarks are PULLED once per animation frame instead of pushed through React
  * state — 30 re-renders a second of the whole tree would cost more than the draw.
  */
@@ -189,6 +198,8 @@ export default function SkeletonOverlay({
 }: SkeletonOverlayProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const faultRef = useRef(faultActive)
+  /** The video geometry the last drawn skeleton was projected through. */
+  const geometryRef = useRef('')
 
   useEffect(() => {
     faultRef.current = faultActive
@@ -223,6 +234,14 @@ export default function SkeletonOverlay({
       const landmarks = getLandmarks()
       if (!landmarks || landmarks.length === 0) return
       if (!video || video.videoWidth === 0 || video.videoHeight === 0) return
+
+      // A camera switch changes the intrinsic size under us. The canvas was cleared
+      // above, so skipping this one frame shows nothing rather than the old camera's pose
+      // stretched across the new one's letterbox.
+      const geometry = `${video.videoWidth}x${video.videoHeight}`
+      const settled = geometry === geometryRef.current
+      geometryRef.current = geometry
+      if (!settled) return
 
       const layout = coverLayout(video.videoWidth, video.videoHeight, box)
       paint(ctx, landmarks, layout, box, mirrored, faultRef.current ? DRAW.FAULT_STROKE : DRAW.CLEAN_STROKE)

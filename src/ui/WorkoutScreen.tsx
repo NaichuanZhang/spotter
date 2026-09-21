@@ -9,8 +9,14 @@
  * element we hand up via onVideoReady. If it has not done so shortly after mount
  * we acquire the stream ourselves, because a black rectangle on stage is fatal and
  * a duplicate getUserMedia call is not.
+ *
+ * THAT FALLBACK IS THE SECOND getUserMedia CALL SITE IN THE APP, so it honours
+ * `cameraDeviceId` too. A slow "Allow" click used to be all it took for the engine
+ * to open the chosen iPhone while this path opened the lid camera on top of it.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { openCameraStream, stopStream } from '../pose/cameraStream'
+import type { OpenedCamera } from '../pose/cameraStream'
 import type { PersonaId } from '../types/tools'
 import type { WorkoutState } from '../types/events'
 import type { MicState } from '../coach/micUplink'
@@ -38,16 +44,21 @@ const CAMERA = {
   } as MediaTrackConstraints,
 } as const
 
-function stopStream(stream: MediaStream): void {
-  for (const track of stream.getTracks()) track.stop()
-}
-
-async function acquireCamera(): Promise<MediaStream> {
+/**
+ * Same acquisition rules as the engine (`pose/cameraStream.ts`): pin the chosen device,
+ * and if that device has gone home in someone's pocket, open the default camera once
+ * rather than leaving the stage black.
+ */
+async function acquireCamera(deviceId: string | null): Promise<OpenedCamera<MediaStream>> {
   const media = navigator.mediaDevices
   if (!media || typeof media.getUserMedia !== 'function') {
     throw new Error('No camera API in this browser — SPOTTER needs https or localhost.')
   }
-  return media.getUserMedia({ video: CAMERA.CONSTRAINTS, audio: false })
+  return openCameraStream({
+    base: CAMERA.CONSTRAINTS,
+    deviceId,
+    getUserMedia: (constraints) => media.getUserMedia(constraints),
+  })
 }
 
 interface WorkoutScreenProps {
@@ -68,6 +79,11 @@ interface WorkoutScreenProps {
   readonly clip: ReferenceClipSpec | null
   readonly onDismissClip: () => void
   readonly getLandmarks: LandmarkSource
+  /**
+   * The camera the user chose, or null for "let the browser pick". Only used by the
+   * fallback path below — the engine gets the same value directly from App.
+   */
+  readonly cameraDeviceId?: string | null
   /**
    * Hand the element to the pose engine. Returns true when the engine has CLAIMED
    * it — meaning the engine owns the camera from here and this component must not
@@ -99,26 +115,53 @@ export default function WorkoutScreen({
   clip,
   onDismissClip,
   getLandmarks,
+  cameraDeviceId = null,
   onVideoReady,
 }: WorkoutScreenProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const ownedStreamRef = useRef<MediaStream | null>(null)
+  /**
+   * Read by the fallback TIMER, which fires 1200 ms after mount and must use whatever
+   * camera is selected by then. A ref, not a dep: `takeOverCamera` is a dependency of the
+   * claim effect below, and re-running that effect is the AbortError this file is about.
+   */
+  const deviceIdRef = useRef<string | null>(cameraDeviceId)
+  /**
+   * True once the fallback has taken the element over — i.e. the engine never claimed it.
+   * Separate from `ownedStreamRef` on purpose: during a switch that ref is briefly null,
+   * and a second switch arriving in that gap must still know the fallback is the owner.
+   * Testing the stream instead left the stage black for the rest of the set.
+   */
+  const fallbackOwnsRef = useRef(false)
   const [cameraError, setCameraError] = useState<string | null>(null)
   const latched = useFaultLatch(faultCandidate)
 
-  const takeOverCamera = useCallback((element: HTMLVideoElement) => {
-    acquireCamera()
-      .then((stream) => {
-        ownedStreamRef.current = stream
-        element.srcObject = stream
-        return element.play()
-      })
-      .catch((error: unknown) => {
-        const detail = error instanceof Error ? error.message : String(error)
-        console.error('[spotter] camera could not be started:', detail)
-        setCameraError(detail)
-      })
+  const failCamera = useCallback((error: unknown) => {
+    const detail = error instanceof Error ? error.message : String(error)
+    console.error('[spotter] camera could not be started:', detail)
+    setCameraError(detail)
   }, [])
+
+  const takeOverCamera = useCallback(
+    (element: HTMLVideoElement) => {
+      fallbackOwnsRef.current = true
+      acquireCamera(deviceIdRef.current)
+        .then((opened) => {
+          ownedStreamRef.current = opened.stream
+          element.srcObject = opened.stream
+          if (opened.fellBack) {
+            console.warn('[spotter] the chosen camera is unavailable — opened the default camera instead.')
+          }
+          return element.play()
+        })
+        .catch(failCamera)
+    },
+    [failCamera],
+  )
+
+  useEffect(() => {
+    deviceIdRef.current = cameraDeviceId
+  }, [cameraDeviceId])
 
   useEffect(() => {
     const element = videoRef.current
@@ -139,6 +182,7 @@ export default function WorkoutScreen({
     return () => {
       cancelled = true
       if (timer !== null) window.clearTimeout(timer)
+      fallbackOwnsRef.current = false
       const owned = ownedStreamRef.current
       if (owned) {
         stopStream(owned)
@@ -146,6 +190,42 @@ export default function WorkoutScreen({
       }
     }
   }, [onVideoReady, takeOverCamera])
+
+  /**
+   * Follow the selection while WE own the stream — i.e. only in the world where the engine
+   * never claimed the element. When the engine did claim it, `fallbackOwnsRef` is false and
+   * this is a no-op: switching is the engine's job and two owners would fight over
+   * srcObject. Stop first, then acquire, so the old camera light goes out.
+   */
+  useEffect(() => {
+    const element = videoRef.current
+    if (!element || !fallbackOwnsRef.current) return undefined
+
+    let cancelled = false
+    const owned = ownedStreamRef.current
+    if (owned) {
+      stopStream(owned)
+      ownedStreamRef.current = null
+    }
+    acquireCamera(cameraDeviceId)
+      .then((opened) => {
+        if (cancelled) {
+          // Superseded by a newer choice: stop what we opened rather than leave it live.
+          stopStream(opened.stream)
+          return undefined
+        }
+        ownedStreamRef.current = opened.stream
+        element.srcObject = opened.stream
+        return element.play()
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) failCamera(error)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [cameraDeviceId, failCamera])
 
   return (
     <main className="workout">

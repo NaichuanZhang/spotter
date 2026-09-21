@@ -29,6 +29,7 @@
  * count comes from the `target` prop. No persona string is typed into this screen.
  */
 import { useCallback, useMemo, useState } from 'react'
+import type { ReactNode } from 'react'
 import type { PersonaId } from '../types/tools'
 import { personaView } from './PersonaRail'
 import AvatarStage from './AvatarStage'
@@ -42,6 +43,15 @@ interface IntroScreenProps {
   readonly onPersona: (persona: PersonaId) => void
   readonly onStart: () => void
   readonly target: number
+  /**
+   * The camera picker (src/ui/CameraPicker.tsx), mounted under the coach cards because
+   * which camera is watching is the same kind of setup decision as which coach is
+   * talking — made once, before the set. A slot rather than an import so this screen
+   * keeps owning nothing but the sound contract and its two callbacks; App owns the
+   * selection state, and the picker's CSS is scoped to `.intro`, which is why it belongs
+   * inside this subtree rather than beside it.
+   */
+  readonly cameraPicker?: ReactNode
 }
 
 /**
@@ -53,7 +63,7 @@ type SoundState = 'muted' | 'on' | 'blocked'
 
 const BLOCKED_MESSAGE = 'Your browser held the sound back — tap the speaker to try again.'
 
-export default function IntroScreen({ persona, onPersona, onStart, target }: IntroScreenProps) {
+export default function IntroScreen({ persona, onPersona, onStart, target, cameraPicker }: IntroScreenProps) {
   const [sound, setSound] = useState<SoundState>('muted')
   const active = personaView(persona)
 
@@ -97,6 +107,9 @@ export default function IntroScreen({ persona, onPersona, onStart, target }: Int
         </section>
 
         <PersonaCards persona={persona} onSelect={pickPersona} />
+        {/* Sibling of the cards, one beat behind them in the reveal — the picker brings
+            its own `data-reveal` timing. An empty slot renders no element at all. */}
+        {cameraPicker}
       </div>
 
       <IntroGrain />

@@ -1833,3 +1833,304 @@ body {
   .ending__body,
   .ending__body[data-clip='true'] { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* ============================================================================
+   CAMERA PICKER — appended block (intro screen)
+
+   Appended, not merged into the intro block above, for the same reason the ending
+   screen's second pass was: the rules up there are not ours to change. Everything
+   here is scoped under `.intro .campick`, and the three shared classes it reuses
+   (.picker__head, .keys, kbd, .card__check) are used AS WRITTEN rather than
+   re-declared — matching the persona cards is the point, so the row's check mark is
+   literally their check mark.
+
+   Against the doctrine at the top of this file:
+
+   1. ONE GLASS LAYER, NEVER TWO STACKED. The material is on `.campick__panel` and
+      nowhere else. The preview stage and the device rows are plain inset surfaces
+      inside it — the same choice the reference clip makes inside the HUD panel. The
+      collapsed bar and the open body share that one panel instead of each carrying
+      their own, which is why opening it adds a hairline rather than a second card.
+   2. QUIET UNTIL THERE IS A DECISION. `data-emphasis="quiet"` (exactly one camera,
+      or no camera at all) removes the material entirely and leaves a line of text:
+      a fact does not need a control around it. `"offered"` (a real choice, or a
+      permission we need) earns the glass.
+   3. HUE IS A CHANNEL. Persona accent on the frame only — the selected row's border,
+      the iPhone badge, the check mark. No numeral is painted here at all. A camera
+      that has failed uses --fault, which is the same thing the workout screen's
+      "Camera unavailable." already does; it is a truth, not a metric.
+   4. --ease for every curve, and only the --fs-* rungs of the intro's closed scale.
+   ========================================================================== */
+
+.intro .campick { display: grid; gap: 9px; }
+
+/* The single glass layer. Quiet mode keeps the content and drops the material. */
+.intro .campick__panel {
+  border-radius: var(--radius);
+  transition: background 420ms var(--ease), border-color 420ms var(--ease);
+  /* This block is the LAST thing in the intro's scroller, so opening it scrolls it into
+     view (CameraPicker's panelScrollOptions). Without a scroll margin `block: 'nearest'`
+     parks the panel flush against the bottom edge, which clips the preview's own caption
+     by a few pixels and reads as a cut-off page rather than a panel that arrived. */
+  scroll-margin-block: 16px;
+}
+
+.intro .campick[data-emphasis='offered'] .campick__panel {
+  padding: 11px 13px;
+  border: 1px solid var(--glass-border);
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--inset-hi), 0 16px 40px -30px rgba(0, 0, 0, 0.9);
+}
+
+.intro .campick__bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.intro .campick__spacer { flex: 1; }
+
+.intro .campick__now {
+  min-width: 0;
+  font-size: var(--fs-13);
+  line-height: 1.4;
+  letter-spacing: var(--tr-body);
+  color: var(--ink-dim);
+}
+
+/* The iPhone is the reason this control exists, so it is named before the list is
+   even open. Accent-tinted because it is frame, not data. */
+.intro .campick__flag {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in oklab, var(--accent) 44%, transparent);
+  background: color-mix(in oklab, var(--accent) 13%, transparent);
+  font-size: var(--fs-10);
+  font-weight: 600;
+  letter-spacing: var(--tr-caps-2);
+  text-transform: uppercase;
+  color: color-mix(in oklab, var(--accent) 80%, white);
+}
+
+/* Same treatment as the intro's sound affordance: a caps micro-label, not a button
+   shape, so it sits under the CTA in the visual hierarchy rather than beside it. */
+.intro .campick__toggle {
+  padding: 3px 2px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  font-size: var(--fs-10);
+  font-weight: 600;
+  letter-spacing: var(--tr-caps-2);
+  text-transform: uppercase;
+  color: var(--ink-dim);
+  cursor: pointer;
+  transition: color 240ms var(--ease);
+}
+
+.intro .campick__toggle:hover { color: var(--ink); }
+
+.intro .campick__toggle:focus-visible {
+  outline: none;
+  color: var(--ink);
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--accent) 70%, transparent);
+}
+
+.intro .campick__body {
+  display: grid;
+  grid-template-columns: minmax(0, 176px) minmax(0, 1fr);
+  gap: 13px;
+  align-items: start;
+  margin-top: 11px;
+  padding-top: 11px;
+  border-top: 1px solid var(--glass-border);
+  animation: campickOpen 320ms var(--ease) both;
+}
+
+/* -------------------------------------------------------- live preview */
+/* Inset surface, not a second card. 16:9 by construction so a camera that reports a
+   different resolution cannot resize the layout — object-fit does the adapting, and
+   nothing here caches a frame size. */
+.intro .campick__stage {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  border-radius: 14px;
+  overflow: hidden;
+  background: #04060a;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.07);
+  isolation: isolate;
+}
+
+/* Mirrored, exactly like .workout__video: the user reads themselves as a mirror, so
+   the preview must not be the one honest-but-confusing rectangle on the screen. */
+.intro .campick__video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transform: scaleX(-1);
+  opacity: 0;
+  transition: opacity 420ms var(--ease);
+}
+
+.intro .campick__stage[data-status='live'] .campick__video { opacity: 1; }
+
+.intro .campick__stageNote {
+  position: absolute;
+  left: 8px;
+  bottom: 7px;
+  font-size: var(--fs-10);
+  font-weight: 600;
+  letter-spacing: var(--tr-caps-2);
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.8);
+}
+
+.intro .campick__stage[data-status='live'] .campick__stageNote { color: var(--ink-dim); }
+
+.intro .campick__stage[data-status='lost'] .campick__stageNote,
+.intro .campick__stage[data-status='failed'] .campick__stageNote { color: var(--fault); }
+
+/* --------------------------------------------------------- device rows */
+.intro .campick__rows { display: grid; gap: 7px; }
+
+.intro .campick__row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  /* A GRID ITEM'S AUTOMATIC MINIMUM IS ITS MIN-CONTENT WIDTH, and the name inside is
+     `white-space: nowrap`, so this row's min-content is the WHOLE device label — which
+     real labels reach ("FaceTime HD Camera (2C0E:82E3)"). Without this the row refused
+     to shrink to its track and ran 35 px past the panel and off the right edge of a
+     390 px viewport, taking the state word with it. `min-width: 0` hands the shrinking
+     back to .campick__rowName, which already has the ellipsis to do it with. */
+  min-width: 0;
+  padding: 9px 11px;
+  text-align: left;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  border-radius: 13px;
+  border: 1px solid var(--glass-border);
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--ink-dim);
+  transition:
+    color 320ms var(--ease),
+    border-color 320ms var(--ease),
+    background 320ms var(--ease);
+}
+
+.intro .campick__row:hover { color: var(--ink); background: rgba(255, 255, 255, 0.06); }
+
+.intro .campick__row:focus-visible {
+  outline: none;
+  color: var(--ink);
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--accent) 70%, transparent);
+}
+
+.intro .campick__row[aria-checked='true'] {
+  color: var(--ink);
+  border-color: color-mix(in oklab, var(--accent) 52%, transparent);
+  background: color-mix(in oklab, var(--accent) 11%, transparent);
+}
+
+/* A row that just appeared — the phone woke up. One pass, then it is an ordinary row:
+   a permanent highlight would read as a property of that camera. The duration mirrors
+   CAMERA_PICKER_UI.arrivalMarkMs, which is when the mark is dropped in JS. */
+.intro .campick__row[data-fresh='true'] { animation: campickFresh 2600ms var(--ease) both; }
+
+.intro .campick__rowName {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: var(--fs-13);
+  letter-spacing: var(--tr-body);
+}
+
+.intro .campick__badge {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--hairline-2);
+  font-size: var(--fs-10);
+  font-weight: 600;
+  letter-spacing: var(--tr-caps-2);
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.intro .campick__badge[data-kind='iphone'] {
+  border-color: color-mix(in oklab, var(--accent) 46%, transparent);
+  background: color-mix(in oklab, var(--accent) 14%, transparent);
+  color: color-mix(in oklab, var(--accent) 82%, white);
+}
+
+.intro .campick__rowState {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: var(--fs-10);
+  letter-spacing: var(--tr-caps-2);
+  text-transform: uppercase;
+  color: rgba(242, 246, 252, 0.24);
+}
+
+/* .card__check's own rules carry the shape and the hidden tick; these two carry the
+   checked state, which is scoped to .card up there and cannot reach in here. */
+.intro .campick__row[aria-checked='true'] .campick__rowState { color: color-mix(in oklab, var(--accent) 80%, white); }
+.intro .campick__row[aria-checked='true'] .card__check { background: var(--accent); border-color: var(--accent); color: #06080b; }
+.intro .campick__row[aria-checked='true'] .card__check svg { opacity: 1; }
+
+.intro .campick__hint {
+  margin: 3px 0 0;
+  font-size: var(--fs-11);
+  line-height: 1.45;
+  letter-spacing: var(--tr-body);
+  color: var(--ink-faint);
+}
+
+/* One line, and only when there is something to say — display:none rather than a
+   reserved row, so the grid gap does not leave a hole on the common path. */
+.intro .campick__note {
+  margin: 0;
+  font-size: var(--fs-13);
+  line-height: 1.4;
+  letter-spacing: var(--tr-body);
+  color: var(--ink-dim);
+}
+
+.intro .campick__note[data-on='false'] { display: none; }
+
+@keyframes campickOpen {
+  from { opacity: 0; transform: translate3d(0, -6px, 0); }
+  to { opacity: 1; transform: none; }
+}
+
+/* A RING, not a background: the row that just appeared is very often also the SELECTED
+   one — a remembered iPhone waking up is the normal case — and animating border or
+   background would land that row on the unselected colours when the mark expires.
+   A shadow resolves to nothing and leaves the selected state exactly as it was. */
+@keyframes campickFresh {
+  0% {
+    box-shadow:
+      0 0 0 2px color-mix(in oklab, var(--accent) 72%, transparent),
+      0 0 20px -4px color-mix(in oklab, var(--accent) 60%, transparent);
+  }
+  70% {
+    box-shadow:
+      0 0 0 1px color-mix(in oklab, var(--accent) 38%, transparent),
+      0 0 14px -6px color-mix(in oklab, var(--accent) 30%, transparent);
+  }
+  100% { box-shadow: 0 0 0 0 transparent, 0 0 0 0 transparent; }
+}
+
+/* Phone: the preview takes the full column above the list rather than squeezing both
+   into 176px, and the rows keep their touch height. */
+@media (max-width: 720px) {
+  .intro .campick__body { grid-template-columns: minmax(0, 1fr); }
+  .intro .campick__row { padding: 11px; }
+}

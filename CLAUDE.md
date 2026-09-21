@@ -9,9 +9,9 @@ claude --resume 536d8139-2b8c-4a3b-b7c2-400e0c5d91ae
 - **Session ID:** `536d8139-2b8c-4a3b-b7c2-400e0c5d91ae`
 - **Created:** 2026-09-18 12:35
 - **Status:** active
-- **Gates, last verified 2026-09-20:** `tsc --noEmit` 0 errors · vitest **566 passed / 19 skipped** ·
-  `npm run build` clean · `node scripts/render-refs.mjs --verify-only` exit 0 ·
-  `node scripts/verdict-cli.mjs check-sources` exit 0
+- **Gates, last verified 2026-09-21:** `tsc --noEmit` 0 errors · vitest **699 passed / 19 skipped** ·
+  `npm run build` clean · `node scripts/render-refs.mjs --verify-only` exit 0 (2026-09-20) ·
+  `node scripts/verdict-cli.mjs check-sources` exit 0 (2026-09-20)
 
 > Session transcripts are keyed by directory. If this folder is ever moved or
 > renamed, the resume command stops finding the session — see the root
@@ -65,7 +65,8 @@ Everything below is implemented, wired and gated green.
 | Two-way voice | Mic uplink appends 24 kHz PCM16 and never commits — server VAD owns the turn. Half-duplex gate asks `audioOut.isSpeaking()` per buffer. Barge-in is **armed** in `session.ts` (`interruptCoach` + `now`), with a floor-relative trigger, hysteresis hold and echo guard. Bounded silence flush after the mic falls quiet. |
 | Tools | Five: `show_reference`, `set_persona`, `get_workout_state`, `log_set`, `play_music`. `TOOL_DEFS` is the only source of truth and `personas.test.ts` iterates it. |
 | Music | One bed, ducked to `duckedGain` while the coach speaks or the mic is armed. |
-| Screens | Intro (baked per-persona avatar intros, persona cards, audio unlock) → workout (HUD, skeleton overlay, captions, fault slab, reference clip inside the HUD panel) → ending (measured stats, spoken closing line, rendered avatar verdict). |
+| Screens | Intro (baked per-persona avatar intros, persona cards, audio unlock, camera picker) → workout (HUD, skeleton overlay, captions, fault slab, reference clip inside the HUD panel) → ending (measured stats, spoken closing line, rendered avatar verdict). |
+| Camera choice | `pose/cameras.ts` enumerates + remembers, `pose/cameraStream.ts` owns constraints/fallback/switch ordering, `ui/CameraPicker.tsx` (+ `cameraPickerView.ts`, `useCameraDevices`, `useCameraPreview`) is the intro-screen picker with a live preview. The choice reaches BOTH getUserMedia call sites (engine `ENGINE_CONFIG.video`, WorkoutScreen's `takeOverCamera` fallback) — verified in a browser by wrapping `getUserMedia` and reading the constraints. A pinned device that is gone retries once unpinned → `camera_substituted` banner; a live track that ends → `camera_ended` then the default camera. |
 | Server | Plain Node, zero dependencies, `node:` builtins only. `POST /api/session`, `POST /api/verdict`, `GET /healthz`, static hosting of `dist/`. |
 
 ### Two subtraction passes, 2026-09-20
@@ -353,6 +354,17 @@ Facts about the code as it stands, not a work list.
 
 These need a human, a real room, or real hardware. None of them has been checked.
 
+- 🔴 **A REAL iPhone Continuity Camera has never appeared in the picker.** On 2026-09-21 macOS itself
+  listed one (`system_profiler SPCameraDataType` → "Naichuan的iPhone Camera", `iPhone18,4`) and the
+  phone's MICROPHONE was enumerable in Chrome ("Naichuan的iPhone Microphone"), but
+  `enumerateDevices()` returned exactly ONE videoinput — the FaceTime HD Camera — across repeated
+  reads, before and after a successful `getUserMedia`, in Playwright's Chromium. So the iPhone half of
+  this feature is exercised only against a synthetic second `videoinput` (a shimmed
+  `enumerateDevices` + a canvas `captureStream`), which proved the whole switch path including the
+  arrival announcement and the workout opening the chosen device. What is unproven is Chrome exposing
+  a real Continuity Camera at all: try Safari, or a Chrome where the phone is unlocked, stationary and
+  not in use by another app. The classification is label-based (`/iphone/i`, `/continuity/i`) and the
+  real macOS label is localised ("Naichuan的iPhone Camera" matches; a fully-localised label may not).
 - **Perceived sound**: whether the rendered face and lip-sync look right, whether the verdict voice
   reads as the SAME coach as the intro clip, whether eleanor sounds delighted or matronly, whether the
   client-side compressor chain sounds right, and whether ~30 s of rest actually feels like it covers the
